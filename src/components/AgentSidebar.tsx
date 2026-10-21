@@ -136,15 +136,19 @@ export function AgentSidebar({ machines, selectedMachineId, selectedPaneId, stat
   const describe = ({ machine, entry }: AgentRow) => {
     const { pane, workspace, tab, agent, agentLabel } = entry;
     const online = machine.state === "connected";
-    const title = pane.label?.trim() || agent?.title?.trim() || pane.title?.trim() || displayPaneTitle(pane);
+    const agentTitle = pane.label?.trim() || agent?.title?.trim() || pane.title?.trim() || displayPaneTitle(pane);
+    const tabs = machine.snapshot?.tabs.filter((candidate) => candidate.workspace_id === workspace.workspace_id) ?? [];
+    // fork: the tab's name leads the row, like a heading under its workspace; what the agent says it
+    // is working on moves to the second line. A row with no tab name keeps the agent's title.
+    const tabName = agentTabName(tab, tabs, t)?.trim() || null;
+    const title = tabName ?? agentTitle;
     const name = agent?.name?.trim() || null;
     // the name has its own place on the line: the label beside it says the kind instead
     const kindLabel = name !== null && agentLabel === name ? entry.canonicalAgent ?? agent?.title?.trim() ?? null : agentLabel;
-    const tabs = machine.snapshot?.tabs.filter((candidate) => candidate.workspace_id === workspace.workspace_id) ?? [];
     const mark = paneMark(entry);
     const markAgent = mark && hasAgentMark(mark) ? mark : null;
-    const parts = { agentLabel: kindLabel, title, markAgent, machineName: machineName(machine), workspaceLabel: workspace.label, tabName: agentTabName(tab, tabs, t) };
-    const contextParts = agentContext(parts);
+    const parts = { agentLabel: kindLabel, title, markAgent, machineName: machineName(machine), workspaceLabel: workspace.label, tabName: null };
+    const contextParts = [...(agentTitle !== title ? [agentTitle] : []), ...agentContext(parts)];
     const context = contextParts.join(" · ");
     const kind = kindLabel?.trim() || null;
     const markKind = kind && kind !== title.trim() && !contextParts.includes(kind) ? kind : null;
