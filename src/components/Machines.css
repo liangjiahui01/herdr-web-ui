@@ -1,14 +1,22 @@
 /* One PC per group: its name is the head of its workspaces. The monitor sits in the rows'
    leading cell, over the workspaces' folders, and the state line starts where the name does.
    The fold and the + close the header at its right. */
+/* fork: the workspaces show all their rows, up to 40% of the sidebar, and Agents has the rest.
+   With Agents folded or empty, they fill the column as before. */
 .machine-list {
   position: relative;
-  flex: 1 1 0;
+  flex: 0 0 auto;
   min-height: 0;
+  max-height: 40%;
   padding-top: var(--space-2);
   overflow-y: auto;
   overscroll-behavior: contain;
   scroll-padding-bottom: var(--space-4);
+}
+
+.sidebar-shell:has(.agents-sidebar.is-collapsed, .agents-sidebar.is-empty) .machine-list {
+  flex: 1 1 0;
+  max-height: none;
 }
 
 /* When every PC is folded, keep this section at its headings instead of reserving the whole
