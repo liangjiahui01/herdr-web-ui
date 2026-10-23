@@ -2,7 +2,7 @@ import { lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "no
 import { basename, dirname, join, relative, resolve, sep, win32 } from "node:path";
 import type { CommandForm, SlashCommand } from "../../shared/protocol.ts";
 import type { AgentCommandSource } from "./index.ts";
-import { ancestorsToRepoRoot, environRecord, environValue, piTemplates, plainObject, readFrontmatter, readSkillText } from "./walk.ts";
+import { ancestorsToRepoRoot, environRecord, environValue, MAX_WALK_FOLDERS, piTemplates, plainObject, readFrontmatter, readSkillText } from "./walk.ts";
 
 /**
  * Pinned to codex-rs at 83086188ae0614bd882818ff1aa23f3194962012 (rust-v0.163.0 for the slash table):
@@ -59,11 +59,17 @@ function manifestName(root: string): string | null {
 
 interface FoundSkill { readonly name: string; readonly description: string; readonly path: string }
 
-/** SKILL.md files under `root`, to depth 6; `ancestors` guards link cycles along one branch only. */
-function scanSkills(root: string): FoundSkill[] {
+/**
+ * SKILL.md files under `root`, to depth 6; `ancestors` guards link cycles along one branch only, so
+ * sibling links to one folder multiply the paths: every folder resolved counts against `budget`, which
+ * the roots of one discovery share (walk.ts MAX_WALK_FOLDERS).
+ */
+function scanSkills(root: string, budget: { folders: number }): FoundSkill[] {
   const found: FoundSkill[] = [];
   const ancestors = new Set<string>();
   const visit = (directory: string, depth: number): void => {
+    if (budget.folders <= 0) return;
+    budget.folders -= 1;
     let real: string;
     try { real = realpathSync(directory); } catch { return; }
     if (ancestors.has(real)) return;
@@ -143,9 +149,22 @@ export const source: AgentCommandSource = {
     // bare /review opens the "Select a review preset" popup (chatwidget/slash_dispatch.rs:361-367, review_popups.rs:15-65);
     // /review <text> submits a custom review as a turn (slash_dispatch.rs:1092-1093)
     review: [...TERMINAL, { match: "other", interaction: "none" }],
+    // bare opens a text prompt or an export picker; given a name or a path they act and return
+    // (chatwidget/interaction.rs:450-493, transcript_export.rs:8-45, slash_dispatch.rs:807-815, 894-905)
+    rename: [...TERMINAL, { match: "other", interaction: "none" }],
+    export: [...TERMINAL, { match: "other", interaction: "none" }],
+    // `/goal edit` opens a text prompt (slash_dispatch.rs:968-1073)
+    goal: [{ match: "bare", interaction: "unknown" }, { match: { sub: "edit" }, interaction: "terminal" }, { match: "other", interaction: "unknown" }],
   },
-  // the nine names this scanner used to leave out, and the other screens only the TUI can draw
-  terminalBound: ["resume", "permissions", "agents", "hooks", "mcp", "plugins", "skills", "voice", "theme", "config", "setup-default-sandbox"],
+  // the nine names this scanner used to leave out, and the other screens only the TUI can draw. The second
+  // group holds a picker, view, confirmation or prompt whatever follows the name: /new and /fork ask where to
+  // run inside a git repository (worktree_picker.rs:16-85), /cd asks to trust a folder it has not seen
+  // (app/working_directory.rs:263-290), /side and /btw move the TUI into an ephemeral thread (app/side.rs),
+  // /mention leaves "@" and the file search in the composer, /vim leaves the composer in Normal mode
+  // (bottom_pane/textarea.rs:316-326), and /logout signs out and exits
+  terminalBound: ["resume", "permissions", "agents", "hooks", "mcp", "plugins", "skills", "voice", "theme", "config", "setup-default-sandbox",
+    "keymap", "experimental", "approve", "memories", "import", "new", "archive", "delete", "fork", "worktree", "side", "btw", "copy", "tui",
+    "mention", "daemon", "warnings", "cd", "usage", "title", "statusline", "pets", "feedback", "subagents", "vim", "logout"],
   // the popup builds without `apps` and every `debug*` command (bottom_pane/command_popup.rs:91-93); typed by hand they still dispatch
   agentHidden: ["apps", "debug-config", "debug-m-drop", "debug-m-update"],
   pin: "0.163.0",
@@ -175,8 +194,9 @@ export const source: AgentCommandSource = {
       namespaces.set(directory, found);
       return found;
     };
+    const budget = { folders: MAX_WALK_FOLDERS };
     const load = (root: string, origin: SlashCommand["origin"], fallback?: string): void => {
-      for (const skill of scanSkills(root)) {
+      for (const skill of scanSkills(root, budget)) {
         const id = canonical(skill.path);
         if (disabled.has(id) || seen.has(id)) continue;
         seen.add(id);

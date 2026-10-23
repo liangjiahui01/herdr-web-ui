@@ -130,87 +130,69 @@
   white-space: nowrap;
 }
 
+/* the launch's own choices, model and effort, side by side where both fit a field's width, else stacked */
+.new-session-launch {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  column-gap: var(--space-3);
+}
+
+.new-session-launch .field {
+  min-width: 0;
+}
+
+.new-session-launch .input,
+.new-session-launch .select {
+  width: 100%;
+  min-width: 0;
+}
+
+/* the first message: a few lines of the message box's own face and measure, grown by hand */
+.new-session-prompt {
+  height: auto;
+  min-height: calc(var(--control-h) * 2.5);
+  padding: var(--space-2) var(--space-3);
+  line-height: var(--lh-base);
+  resize: vertical;
+}
+
+/* the agent's skills in the folder, under the message: pill chips that wrap, three rows at most before they scroll */
+.new-session-skills-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+
+.new-session-skills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  max-height: calc(var(--control-h) * 3 + var(--space-2) * 2);
+  overflow-y: auto;
+  /* a focused chip's ring shows whole at the row's edge */
+  padding: var(--space-1);
+  margin: calc(var(--space-1) * -1);
+}
+
+.new-session-skill-chip {
+  max-width: 100%;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (pointer: coarse) {
   .new-session-modal .input,
   .new-session-modal .select,
   .new-session-modal .btn {
     height: var(--touch-target);
   }
-}
 
-/* the agent picker: a select whose rows show each agent's mark */
-.agent-picker {
-  position: relative;
-}
-
-.agent-picker-trigger {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  width: 100%;
-  text-align: left;
-  cursor: pointer;
-}
-
-.agent-picker-trigger:disabled {
-  cursor: default;
-  opacity: 0.6;
-}
-
-.agent-picker-label {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-picker-chevron {
-  width: 16px;
-  height: 16px;
-  flex: none;
-  color: var(--text-dim);
-}
-
-.agent-picker .agent-mark,
-.agent-picker-shell {
-  display: inline-flex;
-  flex: none;
-}
-
-.agent-picker-shell svg {
-  width: 16px;
-  height: 16px;
-  color: var(--text-dim);
-}
-
-.agent-picker-menu {
-  position: fixed;
-  z-index: var(--z-popover);
-  overflow-y: auto;
-  /* a scroll that reaches the list's end stays in it: moving the sheet under it would close the list */
-  overscroll-behavior: contain;
-}
-
-/* aria-selected is the chosen agent (bold); the keyboard/pointer row is data-active and carries
-   the highlight, which the shared menu gives aria-selected elsewhere */
-.agent-picker-menu .menu-item[aria-selected="true"] {
-  background: transparent;
-  color: var(--text);
-}
-
-.agent-picker-menu .menu-item[data-active] {
-  background: var(--bg-hover);
-  color: var(--text-strong);
-}
-
-.agent-picker-menu .menu-item[aria-selected="true"] .menu-item-main {
-  font-weight: 600;
-}
-
-@media (pointer: coarse) {
-  .new-session-modal .agent-picker-trigger,
-  .agent-picker-menu .menu-item {
-    height: var(--touch-target);
+  .new-session-modal .new-session-prompt {
+    height: auto;
   }
 }

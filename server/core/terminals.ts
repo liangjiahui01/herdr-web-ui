@@ -54,7 +54,7 @@ export function validGeometry(cols: unknown, rows: unknown): { cols: number; row
  * The server's terminals. `stopped` is read through a getter, as `stop()` sets it later, and `end`
  * is called through one, as the connections are built after the terminals.
  */
-export function createTerminalRegistry({ options, clients, stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending, holdPendingPane, end }: {
+export function createTerminalRegistry({ options, clients, stopped, terminalAttach, holdFor, heldRetry, retryFor, relookupFor, holdPending, holdPendingPane, attached, inputReady, end }: {
   options: { codexHome?: string; devinDbPath?: string; opencodeDb?: string; hermesHome?: string; grokHome?: string };
   clients: Set<Client>;
   stopped: () => boolean;
@@ -65,6 +65,10 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
   relookupFor: number;
   holdPending: (owner: Client, paneId?: string) => void;
   holdPendingPane: (paneId: string, fault: { code: string; message: string }) => void;
+  /** a connection joined the pane's attachment: the pending messages queued for the pane are told to it, and may go through it */
+  attached: (client: Client, paneId: string) => void;
+  /** the pane's terminal takes input again: a pending message waiting for a typist may go now */
+  inputReady: (paneId: string) => void;
   end: (client: Client, reason: "stalled" | "revoked" | "closed") => void;
 }) {
   const attachments = new Map<string, PaneAttachment>();
@@ -122,7 +126,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     else attachment.process.resume();
   }
 
-  function sendOutput(client: Client, paneId: string, data: string): void {
+  function sendOutput(client: Client, paneId: string, data: string, replay = false): void {
     const window = client.data.output.get(paneId);
     const bytes = Buffer.byteLength(data);
     if ((window && window.pending + bytes > OUTPUT_HARD_BYTES) || client.getBufferedAmount() >= OUTPUT_HARD_BYTES) {
@@ -132,6 +136,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     send(client, {
       type: "pty-data", pane_id: paneId, data,
       ...(window ? { flow: { stream_id: window.id, offset: window.write(bytes, wireBytes(data)) } } : {}),
+      ...(replay ? { replay: true as const } : {}),
     });
   }
 
@@ -141,7 +146,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     for (const client of attachment.clients) send(client, message);
   }
 
-  const { spawnAttachment } = createSpawnAttachment({ attachments, retiringAttachments, terminalAttach, isStopped: stopped, closeAttachment, broadcast, sendOutput, reconcileOutput, holdPendingPane, holdFor, heldRetry, retryFor, relookupFor });
+  const { spawnAttachment } = createSpawnAttachment({ attachments, retiringAttachments, terminalAttach, isStopped: stopped, closeAttachment, broadcast, sendOutput, reconcileOutput, holdPendingPane, inputReady, holdFor, heldRetry, retryFor, relookupFor });
 
   function closeAttachment(paneId: string): void {
     const attachment = attachments.get(paneId);
@@ -234,6 +239,7 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
     attachment.clients.delete(client);
     attachment.stalled.delete(client);
     attachment.grids.delete(client);
+    if (attachment.kind === "mirror") attachment.unscreened.delete(client);
     if (attachment.driver === client) attachment.driver = undefined;
     if (attachment.clients.size === 0) closeAttachment(paneId);
     else reconcileOutput(paneId);
@@ -347,15 +353,19 @@ export function createTerminalRegistry({ options, clients, stopped, terminalAtta
       if (!alreadyAttached && attachment.recovering) send(client, { type: "output-recovering", pane_id: message.pane_id });
       if (!alreadyAttached && replay) {
         client.data.output.get(message.pane_id)?.join(replay, client.getBufferedAmount());
-        sendOutput(client, message.pane_id, replay);
+        // marked as the screen from before: the client draws it but takes no new clipboard write from it
+        sendOutput(client, message.pane_id, replay, true);
         // a tail that lost the stream's start may miss what was drawn once: herdr draws it again
         if (attachment.kind !== "mirror" && attachment.ready && !attachment.held && attachment.replay.truncated) requestRepaint(message.pane_id);
       }
+      // a mirror not read yet has no screen from before to hand over: its first screen is this client's replay
+      if (!alreadyAttached && !replay && attachment.kind === "mirror") attachment.unscreened.add(client);
       // a pane waiting for another web bridge to let go says so to each newcomer, too
       if (!alreadyAttached && attachment.held) send(client, { type: "error", code: "attach_held", message: ATTACH_HELD_MESSAGE, pane_id: message.pane_id });
       reconcileOutput(message.pane_id);
       if (connectionOf(client).closing) return;
       if (attachment.ready && !attachment.held) send(client, { type: "input-ready", pane_id: message.pane_id });
+      if (!alreadyAttached) attached(client, message.pane_id);
       if (attachment.kind === "mirror") return;
       if (connectionOf(client).mode === "interact" && !claim.keepSize) {
         // an operator's viewport owns the shared grid

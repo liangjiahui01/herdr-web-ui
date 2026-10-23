@@ -17,6 +17,7 @@ import { checkNotificationView } from "./notification-view-regression.ts";
 import { checkMobileViewport } from "./mobile-viewport-regression.ts";
 import { checkTerminalPinch } from "./terminal-pinch-regression.ts";
 import { checkMobileTabs } from "./mobile-tabs-regression.ts";
+import { checkHeaderLensSwitch } from "./header-lens-switch-regression.ts";
 import { checkTabMenu } from "./tab-menu-regression.ts";
 import { checkDefaultView } from "./default-view-regression.ts";
 import { checkComposerReconnect } from "./composer-reconnect-regression.ts";
@@ -92,6 +93,7 @@ export async function runUiContextChecks(): Promise<void> {
     await timed("checkMobileViewport", () => checkMobileViewport(browser!, origin, paneB));
     await timed("checkTerminalPinch", () => checkTerminalPinch(browser!, origin, paneB));
     await timed("checkMobileTabs", () => checkMobileTabs(browser!, origin));
+    await timed("checkHeaderLensSwitch", () => checkHeaderLensSwitch(browser!, origin));
     await timed("checkTabMenu", () => checkTabMenu(browser!, origin));
     await timed("checkDefaultView", () => checkDefaultView(browser!, origin));
     await timed("checkComposerReconnect", () => checkComposerReconnect(browser!, origin, paneB));

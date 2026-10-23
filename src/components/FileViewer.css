@@ -318,21 +318,8 @@
   .file-viewer-header-stacked .file-viewer-wide { display: none; }
   .file-viewer-header-stacked .file-viewer-more { display: block; }
 
-  /* the reader's page: a reload line (ChunkFailureNotice) above the document when a part failed to load */
-.file-reader-frame {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-}
-
-.file-reader-frame > .file-reader {
-  flex: 1 1 auto;
-  height: auto;
-  min-height: 0;
-}
-
-.file-reader-header {
+  /* the reader's header keeps its name and actions on one row here */
+  .file-reader-header {
     grid-template-columns: minmax(0, 1fr) auto;
     grid-template-areas: "title actions";
   }
@@ -568,7 +555,28 @@
   overflow-wrap: anywhere;
 }
 
-/* a markdown file in a tab of its own (FileReader): the document is the page */
+/*
+ * A markdown file in a tab of its own (FileReader): the document is the page. On screen the frame
+ * fills the window at every width and the reader fills the frame under any reload line above it,
+ * so the reader's body is the one scroll box; if it grew with the document, a wheel over it would
+ * scroll the page instead. Printed (or saved as a PDF), the frame grows with the document again,
+ * so every page of it prints rather than the first screen cut off.
+ */
+@media screen {
+  .file-reader-frame {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .file-reader-frame > .file-reader {
+    flex: 1 1 auto;
+    height: auto;
+    min-height: 0;
+  }
+}
+
 .file-reader {
   height: 100%;
   display: flex;

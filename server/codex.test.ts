@@ -3,9 +3,10 @@ import { appendFileSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSyn
 import { tmpdir } from "node:os";
 import { join, posix, win32 } from "node:path";
 import { Database } from "bun:sqlite";
-import { codexCallFailed, codexHistoryTail, codexHomeInPsLine, codexRolloutPath, processCodexHome, forgetHistoryChains, matchCodexFirstExchange, matchCodexTranscript, matchShortCodexAnswers, parseCodexTranscript, codexPeersIn, resumedThread, rolloutInsideStore, sameDirectory, storedCwdCondition, storedCwds, unansweredCodexQuestions, withoutVerbatimPrefix } from "./codex.ts";
+import { codexCallFailed, codexHistoryTail, codexHomeInPsLine, codexRolloutPath, interactiveCodexRollout, processCodexHome, forgetHistoryChains, matchCodexFirstExchange, matchCodexTranscript, matchShortCodexAnswers, parseCodexTranscript, codexPeersIn, resumedThread, rolloutInsideStore, sameDirectory, storedCwdCondition, storedCwds, unansweredCodexQuestions, withoutVerbatimPrefix } from "./codex.ts";
 import type { HerdrPane } from "../shared/protocol.ts";
 import { splitTurn } from "../src/lib/workBlocks.ts";
+import rolloutHeaders from "./fixtures/codex-rollout-headers.json";
 
 const ts = "2026-09-22T01:00:00.000Z";
 const item = (payload: unknown, timestamp = ts) => ({ type: "response_item", timestamp, payload });
@@ -391,6 +392,99 @@ describe("Codex rollout resolution", () => {
     expect(codexRolloutPath(path, home)).toBeNull();
     writeFileSync(path, JSON.stringify({ type: "session_meta", payload: { source: "cli", thread_source: "subagent" } }));
     expect(codexRolloutPath(path, home)).toBeNull();
+  });
+
+  it("the live reader takes each fixture rollout header as the shared table says", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-codex-eligible-"))); roots.push(root);
+    const home = join(root, "codex"); const day = join(home, "sessions", "2026", "10", "20");
+    mkdirSync(day, { recursive: true });
+    for (const fixture of rolloutHeaders.cases) {
+      const path = join(day, fixture.file);
+      writeFileSync(path, `${JSON.stringify({ type: "session_meta", payload: fixture.payload }).replaceAll('"{{CWD}}"', JSON.stringify(root))}\n`);
+      expect([fixture.name, interactiveCodexRollout(fixture.payload, fixture.file)]).toEqual([fixture.name, fixture.interactive]);
+      expect([fixture.name, codexRolloutPath(path, home)]).toEqual([fixture.name, fixture.interactive ? path : null]);
+    }
+  });
+
+  it("present rollout identities match the canonical filename UUID", () => {
+    const thread = "01a0d000-0000-7000-8000-0000000000bb";
+    const other = "01a0d000-0000-7000-8000-0000000000cc";
+    const name = `rollout-2026-10-20T09-00-00-${thread}.jsonl`;
+    const interactive = (payload: unknown, file = name) => interactiveCodexRollout(payload, file);
+    // both ids are checked when both are there, in any letter case
+    expect(interactive({ id: thread, session_id: thread })).toBe(true);
+    expect(interactive({ id: thread.toUpperCase(), session_id: thread }, name.toUpperCase().replace(".JSONL", ".jsonl"))).toBe(true);
+    expect(interactive({ id: other, session_id: thread })).toBe(false);
+    expect(interactive({ id: thread, session_id: other })).toBe(false);
+    expect(interactive({ session_id: other })).toBe(false);
+    // a paginated rollout's segment carries its thread first
+    expect(interactive({ id: thread }, `rollout-2026-10-20T09-00-00-${thread}_${other}.jsonl`)).toBe(true);
+    expect(interactive({ id: other }, `rollout-2026-10-20T09-00-00-${thread}_${other}.jsonl`)).toBe(false);
+    // malformed identities and headers
+    for (const payload of [{ id: 1 }, { id: "" }, { id: "not-a-thread" }, { id: [thread] }, { session_id: { id: thread } },
+      { id: null }, { id: null, session_id: thread }, { id: thread, session_id: null }, [], "header", null, undefined]) {
+      expect([payload, interactive(payload)]).toEqual([payload, false]);
+    }
+    // a name without a UUID has nothing to contradict, but the ids still must agree
+    expect(interactive({ id: "legacy" }, "rollout-legacy.jsonl")).toBe(true);
+    expect(interactive({ id: thread, session_id: thread.toUpperCase() }, "rollout-legacy.jsonl")).toBe(true);
+    expect(interactive({ id: thread, session_id: other }, "rollout-legacy.jsonl")).toBe(false);
+    expect(interactive({ id: 7 }, "rollout-legacy.jsonl")).toBe(false);
+    // a self-consistent child is still a child: the name proves integrity, not parenthood
+    expect(interactive({ id: thread, session_id: thread, parent_thread_id: other })).toBe(false);
+    expect(interactive({ id: thread, session_id: thread, agent_role: "" })).toBe(false);
+    // a genuine fork continues another thread's history and is a thread of its own
+    expect(interactive({ id: thread, session_id: thread, forked_from_id: other, source: "cli", thread_source: "user",
+      history_base: { thread_id: other, end_ordinal_exclusive: 3, end_byte_offset: 400 } })).toBe(true);
+  });
+
+  it("checks the identity against the file a link inside the store names, and refuses a link out of it", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-codex-link-"))); roots.push(root);
+    const home = join(root, "codex"); const day = join(home, "sessions", "2026", "10", "20");
+    mkdirSync(day, { recursive: true });
+    const thread = "01a0d000-0000-7000-8000-0000000000bb";
+    const other = "01a0d000-0000-7000-8000-0000000000cc";
+    const header = `${JSON.stringify({ type: "session_meta", payload: { id: thread, session_id: thread, source: "cli" } })}\n`;
+    const real = join(day, `rollout-2026-10-20T09-00-00-${thread}.jsonl`);
+    writeFileSync(real, header);
+    // the link's own name contradicts the header, the file it resolves to does not
+    symlinkSync(real, join(day, `rollout-2026-10-20T09-00-00-${other}.jsonl`));
+    expect(codexRolloutPath(join(day, `rollout-2026-10-20T09-00-00-${other}.jsonl`), home)).toBe(real);
+    // and a well-named, self-consistent rollout outside the store stays out
+    const outside = join(root, `rollout-2026-10-20T09-00-00-${thread}.jsonl`);
+    writeFileSync(outside, header);
+    symlinkSync(outside, join(day, "escape.jsonl"));
+    expect(codexRolloutPath(outside, home)).toBeNull();
+    expect(codexRolloutPath(join(day, "escape.jsonl"), home)).toBeNull();
+  });
+
+  it("a cut header cannot hide a child marker from the live reader", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "herdr-codex-cut-"))); roots.push(root);
+    const home = join(root, "codex"); const day = join(home, "sessions", "2026", "10", "20");
+    mkdirSync(day, { recursive: true });
+    const thread = "01a0d000-0000-7000-8000-0000000000bb";
+    const path = join(day, `rollout-2026-10-20T09-00-00-${thread}.jsonl`);
+    const write = (padding: number, marker: boolean) => writeFileSync(path, `${JSON.stringify({ type: "session_meta", payload: {
+      id: thread, source: "cli", base_instructions: { text: "i".repeat(padding) }, ...(marker ? { thread_source: "subagent" } : {}) } })}\n{"type":"event_msg"}\n`);
+    // a header within the 256 KiB the reader takes is read whole, its marker included
+    write(200 * 1024, false);
+    expect(codexRolloutPath(path, home)).toBe(path);
+    write(200 * 1024, true);
+    expect(codexRolloutPath(path, home)).toBeNull();
+    // one longer than that cannot be checked, with or without a marker past the read
+    write(256 * 1024, true);
+    expect(codexRolloutPath(path, home)).toBeNull();
+    write(256 * 1024, false);
+    expect(codexRolloutPath(path, home)).toBeNull();
+    // byte boundaries: whole JSON that fills the read is not proof its line ends there
+    const line = `${JSON.stringify({ type: "session_meta", payload: { id: thread, source: "cli" } })}`;
+    const exact = (body: string) => { writeFileSync(path, body); return codexRolloutPath(path, home); };
+    expect(exact(`${line.padEnd(256 * 1024 - 1, " ")}\n{"type":"event_msg"}\n`)).toBe(path);
+    expect(exact(`${line.padEnd(256 * 1024, " ")}\n{"type":"event_msg"}\n`)).toBeNull();
+    expect(exact(`${line.padEnd(256 * 1024 + 1, " ")}\n`)).toBeNull();
+    expect(exact(`${line.padEnd(256 * 1024, " ")}{"parent_thread_id":"${thread}"}\n`)).toBeNull();
+    // a file that is only its header, without a newline, ends within the read
+    expect(exact(line.padEnd(256 * 1024 - 1, " "))).toBe(path);
   });
 
   it("reads the Windows paths Codex stores with the \\\\?\\ prefix as the plain ones herdr reports (#518)", () => {

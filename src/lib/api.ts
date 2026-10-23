@@ -1,8 +1,10 @@
+import { apiFetch as fetch } from "./api-request-id.ts";
 import type { PreferencesChange, SharedPreferences } from "../../shared/preferences.ts";
 import type { SeenFinish } from "../../shared/seen.ts";
 import { resumeConnectionTraces } from "./connectionTrace.ts";
-import { machinePath, type BridgeHealth, type HerdrIdentity, type Machine, type SetupAction, type SetupJob, type SetupRequest } from "../../shared/machines.ts";
+import { machinePath, type BridgeHealth, type HerdrIdentity, type Machine, type MachineRoster, type SetupAction, type SetupJob, type SetupRequest } from "../../shared/machines.ts";
 import type {
+  WorkspaceMoved,
   AgentKind,
   AgentRenameRequest,
   CommandOutcome,
@@ -55,6 +57,7 @@ import type {
   SplitPaneRequest,
   SwapPaneRequest,
   TabCreated,
+  UpdateInstallRequest,
   UsageReport,
   WorkspaceCreated,
   PluginActionRequest,
@@ -68,7 +71,7 @@ import type {
 } from "../../shared/protocol.ts";
 import { SUPPORTED_AGENT_KINDS } from "../../shared/supported-agents.ts";
 import type { PaneScrollInfo } from "../../shared/herdr-api.generated.ts";
-import { readInstalledNotes, readUpdateNotes, type HerdrUpdateStatus, type InstalledNotes, type UpdateCommand, type UpdateNotes, type UpdateStatus } from "../../shared/update.ts";
+import { readInstalledNotes, readUpdateNotes, type HerdrUpdateStatus, type InstalledNotes, type UpdateNotes, type UpdateRequest, type UpdateStatus } from "../../shared/update.ts";
 import type { AlertPrefs } from "../../shared/notify-policy.ts";
 import type { TelemetryChange, TelemetryStatus } from "../../shared/telemetry.ts";
 import type { VoiceConfigUpdate, VoiceStatus } from "../../shared/voice.ts";
@@ -120,9 +123,12 @@ export async function fetchInstalledNotes(): Promise<InstalledNotes> {
   return readInstalledNotes(await getJson<unknown>("/api/updates/installed"));
 }
 
-export async function requestUpdate(command: UpdateCommand): Promise<void> {
-  const url = `/api/updates/${command}`;
-  const response = await fetch(url, { method: "POST", headers: { "x-herdr-update": "1" } });
+/** A check goes without a body; an install names the release the person was offered. */
+export async function requestUpdate(request: UpdateRequest): Promise<void> {
+  const url = `/api/updates/${request.command}`;
+  const response = await fetch(url, request.command === "install"
+    ? { method: "POST", headers: { "x-herdr-update": "1", "content-type": "application/json" }, body: JSON.stringify({ expected_revision: request.expected_revision } satisfies UpdateInstallRequest) }
+    : { method: "POST", headers: { "x-herdr-update": "1" } });
   if (!response.ok) throw await errorFrom(url, response);
 }
 
@@ -212,6 +218,15 @@ export class ApiError extends Error {
  */
 export const routeMissing = (error: unknown): boolean => error instanceof ApiError && error.status === 404 && error.code === "not_found";
 
+/**
+ * The PC proxy's fixed words for another PC's answer it would not pass on (server/remote-json.ts),
+ * in the UI language: they are the detail every error surface shows beside its own sentence.
+ */
+const UNUSABLE_ANSWER: Readonly<Record<string, () => string>> = {
+  remote_response_too_large: () => t("The other PC's answer was larger than this app accepts"),
+  remote_response_invalid: () => t("The other PC's answer could not be read"),
+};
+
 async function errorFrom(url: string, response: Response): Promise<ApiError> {
   let detail = response.statusText;
   let code: string | null = null;
@@ -222,6 +237,7 @@ async function errorFrom(url: string, response: Response): Promise<ApiError> {
   } catch {
     /* non-JSON error body */
   }
+  if (code !== null && Object.hasOwn(UNUSABLE_ANSWER, code)) detail = UNUSABLE_ANSWER[code]!();
   return new ApiError(url, response.status, detail, code);
 }
 
@@ -747,9 +763,13 @@ export async function renameWorkspace(workspaceId: string, label: string, machin
   await sendJson(machinePath(machineId, "workspace/rename"), "POST", { workspace_id: workspaceId, label });
 }
 
-/** POST /api/workspace/move: places the workspace at `insertIndex` in herdr's order (the sidebar order). */
-export async function moveWorkspace(workspaceId: string, insertIndex: number, machineId = "local"): Promise<void> {
-  await sendJson(machinePath(machineId, "workspace/move"), "POST", { workspace_id: workspaceId, insert_index: insertIndex });
+/**
+ * POST /api/workspace/move: places the workspace at `insertIndex` in herdr's order (the sidebar order).
+ * The receipt says which move this was in that PC's server's order (lib/workspaceOrder.ts).
+ */
+export async function moveWorkspace(workspaceId: string, insertIndex: number, machineId = "local"): Promise<WorkspaceMoved> {
+  const response = await sendJson(machinePath(machineId, "workspace/move"), "POST", { workspace_id: workspaceId, insert_index: insertIndex });
+  return (await response.json().catch(() => ({ ok: true }))) as WorkspaceMoved;
 }
 
 /** closeGroup takes the repository's open worktree workspaces with it; herdr refuses to close over them otherwise. */
@@ -766,6 +786,16 @@ export async function removeWorktree(request: RemoveWorktreeRequest, machineId =
 /** GET /api/pane/commands: the slash commands the pane's agent understands (built-in + custom). */
 export async function fetchPaneCommands(paneId: string, machineId = "local"): Promise<SlashCommand[]> {
   return (await getJson<{ commands: SlashCommand[] }>(machinePath(machineId, `pane/commands?pane_id=${encodeURIComponent(paneId)}`))).commands;
+}
+
+/**
+ * GET /api/agent/commands?agent=&cwd=: the commands `agent` would offer in `cwd` before any pane runs it
+ * (the new workspace and tab dialogs list its skills), read from the bridge's tables and the folder; no
+ * process is started for it. A folder of null asks for the agent's own and the user's skills alone.
+ */
+export async function fetchAgentCommands(agent: string, cwd: string | null, machineId = "local"): Promise<SlashCommand[]> {
+  const query = new URLSearchParams({ agent, ...(cwd === null || cwd.trim() === "" ? {} : { cwd }) });
+  return (await getJson<{ commands: SlashCommand[] }>(`${machinePath(machineId, "agent/commands")}?${query.toString()}`)).commands;
 }
 
 /** GET /api/pane/omo-tasks: the background tasks and workflows the pane's OmO session started, and that PC's clock. */
@@ -832,6 +862,31 @@ export async function fetchMachines(signal?: AbortSignal): Promise<Machine[]> {
   const response = await fetch("/api/machines", { signal });
   if (!response.ok) throw await errorFrom("/api/machines", response);
   return ((await response.json()) as { machines: Machine[] }).machines;
+}
+/**
+ * GET /api/machines?verify_source_boot: the roster, and the boot id of the server behind `machineId`
+ * proved during this very request (shared/protocol.ts). Null when the server proves nothing: a
+ * refusal, or an older server that ignored the query. Bounded to 20 s, and ended by `signal`.
+ */
+export async function verifySourceBoot(machineId: string, signal: AbortSignal): Promise<{ machines: Machine[]; boot_id: string } | null> {
+  const path = `/api/machines?verify_source_boot=${encodeURIComponent(machineId)}`;
+  // joined by hand: AbortSignal.any needs Safari 17.4, and without this check a PC's order never
+  // leaves an old epoch after its server restarts
+  const bounded = new AbortController();
+  const end = () => bounded.abort();
+  const timer = setTimeout(end, 20_000);
+  if (signal.aborted) end();
+  else signal.addEventListener("abort", end, { once: true });
+  try {
+    const response = await fetch(path, { signal: bounded.signal, cache: "no-store" });
+    if (!response.ok) return null;
+    const body = (await response.json()) as MachineRoster;
+    const proof = body.verified_source_boot;
+    return proof?.machine_id === machineId && typeof proof.boot_id === "string" && proof.boot_id !== "" ? { machines: body.machines, boot_id: proof.boot_id } : null;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", end);
+  }
 }
 export async function machineRequest<T>(path: string, method = "GET", body?: unknown): Promise<T> {
   const response = await fetch(`/api/machines${path}`, { method, headers: { "content-type": "application/json", "x-herdr-machine": "1" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });

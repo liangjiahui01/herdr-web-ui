@@ -236,6 +236,14 @@ function serviceFile(stateDir: string): OpenCodeServiceConfig | null {
   return config;
 }
 
+/**
+ * The OpenCode version its service file names (OpenCode 2.0.32 writes one), unverified: enough to pick
+ * the form its skills are typed in before any pane runs it, never to trust the service with.
+ */
+export function openCodeInstalledVersion(stateDir?: string): string | null {
+  return readOpenCodeService(stateDir ?? openCodeServiceOptions.stateDir)?.version ?? null;
+}
+
 export function forgetOpenCodeService(): void {
   verified = null;
 }

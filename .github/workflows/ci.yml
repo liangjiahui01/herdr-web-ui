@@ -16,7 +16,9 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: validation-${{ github.workflow }}-${{ github.ref }}
+  # A push to main gets a group of its own commit, so every merge's run finishes and says whether that
+  # merge broke main; a pull request keeps one group per branch and cancels its superseded run.
+  group: validation-${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   changes:

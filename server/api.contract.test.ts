@@ -1,21 +1,22 @@
-import { describe, expect, it, beforeAll, afterAll } from "bun:test";
+import { describe, expect, it, beforeAll, afterAll, spyOn } from "bun:test";
 import { Database } from "bun:sqlite";
-import { appendFileSync, chmodSync, copyFileSync, mkdirSync, mkdtempSync, existsSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, copyFileSync, mkdirSync, mkdtempSync, existsSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { ConversationMonitor } from "./conversation-monitor.ts";
 import { createServer } from "./index.ts";
 import type { AgentKind, AgentStatus, ApiError, HealthAuth, IntegrationsResponse, LanExposure, PortalStatus, PushKey, RemoteAccess, SessionSnapshot, TabMoved, PaneFindResponse, PaneReadResult, UsageReport, WorkspaceCreated, WorktreeListing, WorktreeOpened, WorktreeRemoved } from "../shared/protocol.ts";
+import { SUPPORTED_AGENT_KINDS } from "../shared/supported-agents.ts";
 import { HerdrUpdater } from "./herdr-update.ts";
 import { PortalService } from "./portal.ts";
-import { noInstalledNotes, unmanagedUpdateStatus, type HerdrUpdateStatus, type InstalledNotes, type UpdateNotes } from "../shared/update.ts";
+import { noInstalledNotes, noUpdateNotes, unmanagedUpdateStatus, type HerdrUpdateStatus, type InstalledNotes, type UpdateNotes, type UpdateStatus } from "../shared/update.ts";
 import { USAGE_PROVIDERS, UsageService } from "./usage.ts";
 import { VoiceService } from "./voice.ts";
 import { Telemetry } from "./telemetry.ts";
 import { NOTICE_VERSION, telemetryHarnesses, type TelemetryActive, type TelemetryEvent, type TelemetryStatus } from "../shared/telemetry.ts";
 import { DEFAULT_SETTINGS, telemetrySettingsSnapshot } from "../src/lib/settings.ts";
 import { HerdrSocket } from "../src/lib/ws.ts";
-import { herdrRpc, paneRead, ping, sessionSnapshot, tabCreate, workspaceCreate, workspaceClose } from "./herdr/client.ts";
+import { HerdrError, herdrRpc, paneRead, ping, sessionSnapshot, tabCreate, workspaceCreate, workspaceClose } from "./herdr/client.ts";
 import { startFakePushService, type FakePushService } from "./push.fake.ts";
 import { descriptorPath, type BridgeDescriptor } from "./bridge.ts";
 import { handleMachineRequest } from "./machine-api.ts";
@@ -23,6 +24,7 @@ import type { MachineManager } from "./machines.ts";
 import { TailnetIdentitySource } from "./tailscale.ts";
 import { forgetTranscriptState } from "./conversation.ts";
 import type { RepoDiffFileList, RepoDiffFilePatch, SessionHistoryResponse } from "../shared/protocol.ts";
+import { PendingInputError, PendingInputs } from "./pending-input.ts";
 
 /**
  * Contract test for herdr-web-ui's HTTP + WS surface.
@@ -45,6 +47,18 @@ afterAll(() => {
 });
 
 const base = () => `http://localhost:${server.port}`;
+
+describe("removed Chat rewind API", () => {
+  it("returns 404 for local and machine-prefixed rewind requests", async () => {
+    for (const path of ["/api/pane/rewind", "/api/machines/local/pane/rewind"]) {
+      const response = await fetch(base() + path, {
+        method: "POST", headers: { "content-type": "application/json", "x-herdr-machine": "1" },
+        body: JSON.stringify({ pane_id: "not-a-live-pane", text: "nothing to send" }),
+      });
+      expect(response.status, path).toBe(404);
+    }
+  });
+});
 
 describe("Grok conversation API", () => {
   it.skipIf(process.platform !== "linux")("uses exact process/session evidence, validators and revision-bound output refs", async () => {
@@ -432,6 +446,57 @@ describe("update API", () => {
     const response = await fetch(`${base()}/api/updates/install`, { method: "POST", headers: { "x-herdr-update": "1" } });
     expect(response.status).toBe(409);
     expect((await response.json() as ApiError).error.code).toBe("updates_unmanaged");
+  });
+
+  it("installs only the revision the request names, and tells a release that moved later in the status", async () => {
+    const offered = "a".repeat(40), moved = "b".repeat(40);
+    let status: UpdateStatus = { ...unmanagedUpdateStatus(), managed: true, blocked_reason: null, available: true, latest_revision: offered,
+      latest_version: "9.9.9", current_revision: "c".repeat(40), revision_bound_install: true };
+    const requests: unknown[] = [];
+    const managedState = mkdtempSync(join(tmpdir(), "herdr-update-bound-"));
+    const managed = createServer({ port: 0, stateDir: managedState,
+      updates: { status: () => status, notes: noUpdateNotes, installed: noInstalledNotes, request: (request) => { requests.push(request); } } });
+    const origin = `http://localhost:${managed.port}`;
+    const install = (body: string | undefined, headers: Record<string, string> = { "x-herdr-update": "1", "content-type": "application/json" }) =>
+      fetch(`${origin}/api/updates/install`, { method: "POST", headers, ...(body === undefined ? {} : { body }) });
+    const code = async (response: Response) => ((await response.json()) as ApiError).error.code;
+    try {
+      // a body that names no full commit, or more than an install's 1 KiB
+      for (const body of [undefined, "{}", "not json", JSON.stringify({ expected_revision: "abc" }), JSON.stringify({ expected_revision: offered, pad: "x".repeat(1100) })]) {
+        const response = await install(body);
+        expect(response.status).toBe(400);
+        expect(await code(response)).toBe("invalid_update_install");
+      }
+      // the same-origin gate comes first, whatever the body
+      for (const headers of [{ "content-type": "application/json" }, { "x-herdr-update": "1", origin: "https://untrusted.invalid" }, { "x-herdr-update": "1", "sec-fetch-site": "cross-site" }] as Record<string, string>[]) {
+        expect((await install(JSON.stringify({ expected_revision: offered }), headers)).status).toBe(403);
+      }
+      // reading the status, as a watching device does, asks for nothing
+      expect(((await (await fetch(`${origin}/api/updates`)).json()) as UpdateStatus).revision_bound_install).toBe(true);
+      expect(requests).toEqual([]);
+      // another release on offer already: refused before the supervisor hears of it
+      status = { ...status, latest_revision: moved };
+      const stale = await install(JSON.stringify({ expected_revision: offered }));
+      expect(stale.status).toBe(409);
+      expect(await code(stale)).toBe("update_offer_changed");
+      expect(requests).toEqual([]);
+      // the offer as shown: accepted, and handed on with its revision
+      status = { ...status, latest_revision: offered };
+      const accepted = await install(JSON.stringify({ expected_revision: offered }));
+      expect(accepted.status).toBe(202);
+      expect(requests).toEqual([{ command: "install", expected_revision: offered }]);
+      // a release that moves after the 202 is told by the status, not by the request that finished
+      status = { ...status, phase: "error", latest_revision: moved, error_code: "update_offer_changed", error: "A different release is on offer than the one asked for, so nothing was installed. Review it, then update again." };
+      expect(await (await fetch(`${origin}/api/updates`)).json()).toMatchObject({ phase: "error", error_code: "update_offer_changed", latest_revision: moved });
+      // a supervisor that does not install by revision is sent no install
+      status = { ...status, phase: "idle", error: null, error_code: null, revision_bound_install: undefined };
+      const older = await install(JSON.stringify({ expected_revision: moved }));
+      expect(older.status).toBe(409);
+      expect(await code(older)).toBe("update_restart_required");
+      // a check stays bodyless
+      expect((await fetch(`${origin}/api/updates/check`, { method: "POST", headers: { "x-herdr-update": "1" } })).status).toBe(202);
+      expect(requests).toEqual([{ command: "install", expected_revision: offered }, { command: "check" }]);
+    } finally { managed.stop(); rmSync(managedState, { recursive: true, force: true }); }
   });
 
   it("keeps status and update actions behind the token gate", async () => {
@@ -949,6 +1014,23 @@ describe("agent rename", () => {
     }
   });
 
+  it("answers the new-tab dialog's agent commands to another PC's registered bridge token", async () => {
+    const state = mkdtempSync(join(tmpdir(), "herdr-web-ui-agent-commands-bridge-"));
+    const bridge = createServer({ port: 0, hostname: "127.0.0.1", token: "test-browser-token", machines: false, registerBridge: true, stateDir: state, tailscaleOwner: null });
+    const registered = JSON.parse(readFileSync(descriptorPath(), "utf8")) as BridgeDescriptor;
+    const endpoint = `http://127.0.0.1:${bridge.port}`;
+    const manager = { endpoint: (id: string) => id === "commands-remote" ? { url: endpoint, token: registered.token } : null, trackTerminal: () => () => {} } as unknown as MachineManager;
+    try {
+      expect((await fetch(`${endpoint}/api/agent/commands?agent=claude`)).status).toBe(401);
+      const res = await handleMachineRequest(new Request("http://127.0.0.1/api/machines/commands-remote/agent/commands?agent=claude", { headers: { origin: "http://127.0.0.1" } }), manager);
+      expect(res.status).toBe(200);
+      expect(Array.isArray(((await res.json()) as { commands: unknown[] }).commands)).toBeTrue();
+    } finally {
+      bridge.stop();
+      rmSync(state, { recursive: true, force: true });
+    }
+  });
+
   it("validates the body before asking herdr", async () => {
     for (const [body, code] of [
       [{}, "missing_pane_id"],
@@ -1110,16 +1192,58 @@ describe("tab creation", () => {
     } finally { await workspaceClose(owned.workspace_id); }
   }, 20_000);
 
-  it("returns the created tab when a shell agent is unavailable", async () => {
+  it("refuses a first message without an agent, an empty, oversized or control-laden one, before anything is made", async () => {
+    const owned = await workspaceCreate({ cwd: tmpdir(), label: "herdr-web-ui-test-tab-first-message" });
+    try {
+      const before = (await sessionSnapshot()).tabs.length;
+      for (const [body, reason] of [
+        [{ workspace_id: owned.workspace.workspace_id, agent: null, first_message: "a shell takes no message" }, "no agent"],
+        [{ workspace_id: owned.workspace.workspace_id, agent: { kind: "gjc" }, first_message: "   " }, "blank"],
+        [{ workspace_id: owned.workspace.workspace_id, agent: { kind: "gjc" }, first_message: "x".repeat(20_001) }, "too long"],
+        [{ workspace_id: owned.workspace.workspace_id, agent: { kind: "gjc" }, first_message: "run \u001b[2J this" }, "control characters"],
+        [{ workspace_id: owned.workspace.workspace_id, agent: { kind: "gjc" }, first_message: 42 }, "not a string"],
+      ] as const) {
+        const res = await post(body);
+        expect(res.status, reason).toBe(400);
+        expect(((await res.json()) as ApiError).error.code, reason).toBe("invalid_first_message");
+      }
+      expect((await sessionSnapshot()).tabs.length).toBe(before);
+    } finally {
+      await workspaceClose(owned.workspace.workspace_id);
+    }
+  });
+
+  it("refuses launch arguments the dialog never sends, before anything is made: a tab or line break, a model of two words, an effort the agent does not name", async () => {
+    const owned = await workspaceCreate({ cwd: tmpdir(), label: "herdr-web-ui-test-tab-launch-args" });
+    try {
+      const before = (await sessionSnapshot()).tabs.length;
+      for (const [agent, reason] of [
+        [{ kind: "codex", args: ["--", "run\tthis"] }, "a tab in Codex's prompt"],
+        [{ kind: "codex", args: ["--", "first\nsecond"] }, "a line break in Codex's prompt"],
+        [{ kind: "claude", args: ["--model", "two words"] }, "a model of two words"],
+        [{ kind: "claude", args: ["--effort", "ultra"] }, "an effort Claude Code does not name"],
+        [{ kind: "codex", args: ["-c", "model_reasoning_effort=ultracode"] }, "an effort Codex does not name"],
+      ] as const) {
+        const res = await post({ workspace_id: owned.workspace.workspace_id, agent });
+        expect(res.status, reason).toBe(400);
+        expect(((await res.json()) as ApiError).error.code, reason).toBe("invalid_agent");
+      }
+      expect((await sessionSnapshot()).tabs.length).toBe(before);
+    } finally {
+      await workspaceClose(owned.workspace.workspace_id);
+    }
+  });
+
+  it("returns the created tab when a shell agent is unavailable, and queues no first message for an agent that did not start", async () => {
     const owned = await workspaceCreate({ cwd: tmpdir(), label: "herdr-web-ui-test-tab-shell" });
     const bin = mkdtempSync(join(tmpdir(), "herdr-web-ui-tab-empty-path-"));
     const path = process.env["PATH"];
     try {
       process.env["PATH"] = bin;
-      const res = await post({ workspace_id: owned.workspace.workspace_id, agent: { kind: "gjc" } });
+      const res = await post({ workspace_id: owned.workspace.workspace_id, agent: { kind: "gjc" }, first_message: "Plan the config file" });
       const failed = await res.json() as WorkspaceCreated;
       expect(res.status).toBe(200);
-      expect(failed).toMatchObject({ workspace_id: owned.workspace.workspace_id, agent_started: false, error: { code: "agent_start_failed" } });
+      expect(failed).toMatchObject({ workspace_id: owned.workspace.workspace_id, agent_started: false, error: { code: "agent_start_failed" }, first_message: null });
       expect(failed.error?.message).toContain("gjc is not on this server's PATH");
       expect(failed.pane_id).not.toBe(owned.root_pane.pane_id);
     } finally {
@@ -1128,6 +1252,32 @@ describe("tab creation", () => {
       rmSync(bin, { recursive: true, force: true });
     }
   });
+
+  it("says when the agent started but its first message could not be queued, apart from an agent that did not start", async () => {
+    const owned = await workspaceCreate({ cwd: tmpdir(), label: "herdr-web-ui-test-tab-first-not-queued" });
+    const made: string[] = [];
+    // the queue's own refusals, past the route's checks: its text rule, and a full list
+    const text = spyOn(PendingInputs.prototype, "enqueue").mockImplementation(() => { throw new HerdrError("invalid_submit_text", "refused by the queue"); });
+    try {
+      const res = await post({ workspace_id: owned.workspace.workspace_id, agent: { kind: "muse" }, first_message: "Plan the config file" });
+      expect(res.status).toBe(200);
+      const tab = await res.json() as WorkspaceCreated;
+      expect(tab).toMatchObject({ agent_started: true, first_message: { error: { code: "invalid_submit_text", message: "refused by the queue" } } });
+      expect(tab.error).toBeUndefined();
+    } finally { text.mockRestore(); }
+    const enqueue = spyOn(PendingInputs.prototype, "enqueue").mockImplementation(() => { throw new PendingInputError("pending_limit", "the list is full"); });
+    try {
+      const res = await fetch(`${base()}/api/workspace/create`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ cwd: tmpdir(), label: "herdr-web-ui-test-ws-first-not-queued", agent: { kind: "muse" }, first_message: "Plan the config file" }) });
+      expect(res.status).toBe(200);
+      const created = await res.json() as WorkspaceCreated;
+      made.push(created.workspace_id);
+      expect(created).toMatchObject({ agent_started: true, first_message: { error: { code: "pending_limit", message: "the list is full" } } });
+    } finally {
+      enqueue.mockRestore();
+      await workspaceClose(owned.workspace.workspace_id);
+      for (const id of made) await workspaceClose(id);
+    }
+  }, 30_000);
 });
 
 describe("workspace and discovery endpoints", () => {
@@ -1148,6 +1298,9 @@ describe("workspace and discovery endpoints", () => {
     const { agents } = (await res.json()) as { agents: AgentKind[] };
     expect(agents.some((agent) => agent.kind === "claude")).toBeTrue();
     expect(agents.some((agent) => agent.kind === "omp")).toBeTrue();
+    // omo and gjc are listed only where this server finds them on PATH, so only listed kinds are checked
+    expect(agents.filter((agent) => SUPPORTED_AGENT_KINDS.has(agent.kind) && agent.kind !== "pi" && agent.label === agent.kind).map((agent) => agent.kind)).toEqual([]);
+    expect(agents.find((agent) => agent.kind === "hermes")?.label).toBe("Hermes");
     expect(agents.map((agent) => agent.label)).toEqual([...agents.map((agent) => agent.label)].sort((a, b) => a.localeCompare(b)));
   });
 
@@ -1216,6 +1369,42 @@ describe("workspace and discovery endpoints", () => {
     }
   });
 
+  it("lists an agent's commands for a folder before any pane runs it, locally and through the PC proxy, and refuses what it must", async () => {
+    // GET /api/agent/commands?agent=&cwd=: paneCommands without a pane (the new workspace and tab
+    // dialogs' skill list). A fixture folder with one Codex project skill; the folder is its own
+    // repository boundary, so the scan climbs no further.
+    const root = mkdtempSync(join(tmpdir(), "herdr-web-ui-agent-commands-"));
+    try {
+      mkdirSync(join(root, ".git"));
+      mkdirSync(join(root, ".codex", "skills", "contract-skill"), { recursive: true });
+      writeFileSync(join(root, ".codex", "skills", "contract-skill", "SKILL.md"), "---\nname: contract-skill\ndescription: A fixture skill.\n---\nBody.\n");
+      const query = `?agent=codex&cwd=${encodeURIComponent(root)}`;
+      const listed = await fetch(`${base()}/api/agent/commands${query}`);
+      expect(listed.status).toBe(200);
+      const { commands } = (await listed.json()) as { commands: { name: string; source: string; trigger?: string; origin?: string; provenance?: { verified: boolean } }[] };
+      expect(commands).toContainEqual(expect.objectContaining({ name: "contract-skill", source: "skill", trigger: "$", origin: "project" }));
+      expect(commands.some((command) => command.source === "builtin")).toBeTrue();
+      // no process runs the agent: no row is verified against a version
+      expect(commands.every((command) => command.provenance?.verified === false)).toBeTrue();
+      // the same answer for this PC through the proxy path the remote PCs use
+      const proxied = await fetch(`${base()}/api/machines/local/agent/commands${query}`);
+      expect(proxied.status).toBe(200);
+      expect(await proxied.json()).toEqual({ commands });
+      const refusals: Array<[string, RequestInit | undefined, string]> = [
+        ["", undefined, "missing_agent"],
+        [`?agent=codex&cwd=${encodeURIComponent(join(root, "missing"))}`, undefined, "invalid_cwd"],
+        ["?agent=codex", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }, "method_not_allowed"],
+      ];
+      for (const [refusedQuery, init, code] of refusals) {
+        const refused = await fetch(`${base()}/api/agent/commands${refusedQuery}`, init);
+        expect(refused.status).toBe(400);
+        expect(((await refused.json()) as ApiError).error.code).toBe(code);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("rejects a workspace cwd that is not an existing directory", async () => {
     const res = await fetch(`${base()}/api/workspace/create`, {
       method: "POST",
@@ -1263,7 +1452,9 @@ describe("workspace and discovery endpoints", () => {
         body: JSON.stringify(body),
       });
       expect(changed.status).toBe(200);
-      expect(await changed.json()).toEqual({ ok: true });
+      // a move's receipt names it in this server's order (server/order-sequence.ts); the rest answer as before
+      if (path === "/api/workspace/move") expect(await changed.json()).toEqual({ ok: true, order_epoch: expect.any(String), moved_seq: expect.any(Number) });
+      else expect(await changed.json()).toEqual({ ok: true });
     }
 
     const close = await fetch(`${base()}/api/workspace/close`, {
@@ -1668,6 +1859,38 @@ describe("GET /api/pane/read", () => {
     const res = await fetch(`${base()}/api/pane/read?source=visible`);
     expect(res.status).toBe(400);
   });
+
+  it("reads omitted, zero and small line counts on a live pane with source and format unchanged", async () => {
+    const { snapshot } = (await (await fetch(`${base()}/api/session`)).json()) as { snapshot: SessionSnapshot };
+    const pane = snapshot.panes[0]!;
+    for (const suffix of ["", "&lines=0", "&lines=1", "&lines=5", "&lines=0400"]) {
+      const res = await fetch(`${base()}/api/pane/read?pane_id=${encodeURIComponent(pane.pane_id)}&source=recent&format=ansi${suffix}`);
+      expect(res.status).toBe(200);
+      const { read } = (await res.json()) as { read: PaneReadResult };
+      expect(read.pane_id).toBe(pane.pane_id);
+      expect(read.source).toBe("recent");
+      expect(read.format).toBe("ansi");
+    }
+  });
+
+  it("refuses invalid line counts with invalid_lines for known and unknown panes and keeps serving", async () => {
+    const { snapshot } = (await (await fetch(`${base()}/api/session`)).json()) as { snapshot: SessionSnapshot };
+    for (const pane of [snapshot.panes[0]!.pane_id, "w9999:p9999"]) {
+      for (const lines of ["", "%20%20", "-1", "0.5", "NaN", "Infinity", "4294967296", "9007199254740993", "0.99999999999999999", "1.0", "1e3", "%2B5"]) {
+        const res = await fetch(`${base()}/api/pane/read?pane_id=${encodeURIComponent(pane)}&lines=${lines}`);
+        expect(res.status).toBe(400);
+        expect(((await res.json()) as ApiError).error.code).toBe("invalid_lines");
+      }
+    }
+    const unknown = await fetch(`${base()}/api/pane/read?pane_id=w9999:p9999&lines=10`);
+    expect(((await unknown.json()) as ApiError).error.code).toBe("pane_not_found");
+    for (const [query, code] of [["source=everything", "invalid_source"], ["format=html", "invalid_format"]] as const) {
+      const res = await fetch(`${base()}/api/pane/read?pane_id=${encodeURIComponent(snapshot.panes[0]!.pane_id)}&lines=10&${query}`);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as ApiError).error.code).toBe(code);
+    }
+    expect((await fetch(`${base()}/api/health`)).status).toBe(200);
+  });
 });
 
 describe("POST /api/pane/close", () => {
@@ -1783,6 +2006,73 @@ describe("POST /api/pane/image", () => {
     expect(res.status).toBe(404);
     const body = (await res.json()) as { error: { code: string; message: string } };
     expect(body.error.code).toBe("pane_not_found");
+  });
+
+  const bytes = (...parts: (string | number[])[]) => Buffer.concat(parts.map((part) => typeof part === "string" ? Buffer.from(part, "latin1") : Buffer.from(part)));
+  const RASTER_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+  const pasted = () => existsSync(join(qaCwd!, ".herdr-web-ui")) ? readdirSync(join(qaCwd!, ".herdr-web-ui")).sort() : [];
+
+  it("names each raster after its signature, whichever supported type it claims", async () => {
+    for (const [extension, data] of [
+      ["png", Buffer.from(TINY_PNG_BASE64, "base64")],
+      ["jpg", bytes([255, 216, 255, 224, 0, 16], "JFIF")],
+      ["gif", bytes("GIF87a", [1, 0, 1, 0])],
+      ["gif", bytes("GIF89a", [1, 0, 1, 0])],
+      ["webp", bytes("RIFF", [4, 0, 0, 0], "WEBP")],
+    ] as const) {
+      for (const content_type of RASTER_TYPES) {
+        const res = await post({ pane_id: qaPaneId, content_type, data_base64: data.toString("base64"), name: "shot.jpeg" });
+        expect(res.status).toBe(200);
+        const { path } = (await res.json()) as { path: string };
+        expect(dirname(path)).toBe(join(qaCwd!, ".herdr-web-ui"));
+        expect(basename(path)).toMatch(new RegExp(`^paste-\\d{8}-\\d{6}-[0-9a-f]{8}\\.${extension}$`));
+        expect(readFileSync(path)).toEqual(data);
+      }
+    }
+  });
+
+  it("refuses a fake raster with invalid_image before the pane lookup, writing nothing", async () => {
+    const before = pasted();
+    for (const data of [
+      bytes("SECRET-UPLOAD-TEXT not an image"),
+      bytes([137, 80, 78, 71, 13, 10, 26]),
+      bytes([255, 216]),
+      bytes("GIF88a"),
+      bytes("RIFF", [4, 0, 0, 0], "WEB"),
+      // GIF87a, GIF89a and RIFF....WEBP with each letter's high bit set
+      bytes([0xc7, 0xc9, 0xc6, 0x38, 0x37, 0xe1]),
+      bytes([0xc7, 0xc9, 0xc6, 0x38, 0x39, 0xe1]),
+      bytes([0xd2, 0xc9, 0xc6, 0xc6, 4, 0, 0, 0, 0xd7, 0xc5, 0xc2, 0xd0]),
+    ]) {
+      for (const content_type of RASTER_TYPES) {
+        for (const pane_id of [qaPaneId, "w9999:p9999"]) {
+          const res = await post({ pane_id, content_type, data_base64: data.toString("base64"), name: "secret-name.png" });
+          expect(res.status).toBe(400);
+          const text = await res.text();
+          expect(JSON.parse(text)).toEqual({ error: { code: "invalid_image", message: "file does not contain a supported raster image" } });
+          for (const leaked of ["SECRET", "secret-name", "path"]) expect(text).not.toContain(leaked);
+        }
+      }
+    }
+    expect(pasted()).toEqual(before);
+    // a real raster for an unknown pane still answers pane_not_found, and size errors still come first
+    const gif = await post({ pane_id: "w9999:p9999", content_type: "image/webp", data_base64: bytes("GIF89a", [1, 0]).toString("base64") });
+    expect([gif.status, ((await gif.json()) as ApiError).error.code]).toEqual([404, "pane_not_found"]);
+    const empty = await post({ pane_id: "w9999:p9999", content_type: "image/png", data_base64: "" });
+    expect([empty.status, ((await empty.json()) as ApiError).error.code]).toEqual([400, "empty_image"]);
+  });
+
+  it("keeps generic uploads under their own names and bytes, even when they look like a raster", async () => {
+    for (const [content_type, name, data, pattern] of [
+      ["application/json", "report.json", bytes('{"month":"2026-09"}'), /^report-.*\.json$/],
+      ["application/zip", "bundle.zip", Buffer.from(TINY_PNG_BASE64, "base64"), /^bundle-.*\.zip$/],
+    ] as const) {
+      const res = await post({ pane_id: qaPaneId, content_type, data_base64: data.toString("base64"), name });
+      expect(res.status).toBe(200);
+      const { path } = (await res.json()) as { path: string };
+      expect(basename(path)).toMatch(pattern);
+      expect(readFileSync(path)).toEqual(data);
+    }
   });
 
   it("stores any other file under its own sanitised name", async () => {
@@ -2082,6 +2372,78 @@ describe("WebSocket roles and status push", () => {
       observer.close();
     }
   }, 40_000);
+
+  it("marks only a new attach's replay as replay, with its bytes and ACK offsets unchanged", async () => {
+    const paneId = qaPaneId!;
+    const url = `ws://localhost:${server.port}/ws`;
+    const operator = await RecordingSocket.connect(url);
+    const joiner = await RecordingSocket.connect(url);
+    const observer = await RecordingSocket.connect(url);
+    let rejoined: RecordingSocket | null = null;
+    // the shell prints the product, which the typed command line does not contain
+    const tag = `replay-origin-${process.pid}`;
+    const printed = (product: number) => (m: RecordedFrame) => m.type === "pty-data" && m.pane_id === paneId && String(m.data).includes(`${tag}-${product}`);
+    const frames = (socket: RecordingSocket) => socket.seen.filter((m) => m.type === "pty-data" && m.pane_id === paneId);
+    /** Each frame's offset is the bytes sent before it plus its own: the replay flag moves none of them. */
+    const offsetsFollowBytes = (socket: RecordingSocket) => {
+      let sent = 0;
+      for (const frame of frames(socket)) {
+        sent += Buffer.byteLength(String(frame.data));
+        expect((frame.flow as { offset: number }).offset).toBe(sent);
+      }
+    };
+    try {
+      operator.send({ type: "attach", pane_id: paneId, cols: 100, rows: 30, flow_control: "ack" });
+      await operator.waitFor((m) => m.type === "input-ready" && m.pane_id === paneId, "operator input-ready", 15_000);
+      operator.send({ type: "input", pane_id: paneId, text: `echo ${tag}-$((6*7))\r` });
+      const live = await operator.waitFor(printed(42), "operator live output", 15_000);
+      expect(live.replay).toBeUndefined();
+
+      // a second view joins: the screen from before comes first, marked, byte for byte the tail
+      joiner.send({ type: "attach", pane_id: paneId, cols: 100, rows: 30, flow_control: "ack" });
+      const replay = await joiner.waitFor((m) => m.type === "pty-data" && m.pane_id === paneId, "joiner replay", 15_000);
+      expect(replay.replay).toBe(true);
+      expect(String(replay.data)).toContain(`${tag}-42`);
+      const flow = replay.flow as { stream_id: string; offset: number };
+      expect(flow.offset).toBe(Buffer.byteLength(String(replay.data)));
+      joiner.send({ type: "pty-ack", pane_id: paneId, stream_id: flow.stream_id, offset: flow.offset });
+      await joiner.waitFor((m) => m.type === "input-ready" && m.pane_id === paneId, "joiner input-ready", 5000);
+
+      // the same attach again is idempotent: no second replay, marked or not
+      joiner.seen.length = 0;
+      joiner.send({ type: "attach", pane_id: paneId, cols: 100, rows: 30, flow_control: "ack" });
+      await joiner.waitFor((m) => m.type === "input-ready" && m.pane_id === paneId, "idempotent attach input-ready", 5000);
+      operator.send({ type: "input", pane_id: paneId, text: `echo ${tag}-$((7*8))\r` });
+      await joiner.waitFor(printed(56), "joiner live output", 15_000);
+      expect(frames(joiner).length).toBeGreaterThan(0);
+      expect(frames(joiner).every((frame) => frame.replay === undefined)).toBe(true);
+      expect(joiner.seen.some((m) => m.type === "error" && m.code === "invalid_ack")).toBe(false);
+      expect(frames(operator).filter(printed(56)).every((frame) => frame.replay === undefined)).toBe(true);
+
+      // an observer's attach is a new view too, and a reconnect attaches afresh
+      observer.send({ type: "role", mode: "observe" });
+      await observer.waitFor((m) => m.type === "role-ack", "role-ack", 5000);
+      observer.send({ type: "attach", pane_id: paneId, cols: 100, rows: 30, flow_control: "ack" });
+      const watched = await observer.waitFor((m) => m.type === "pty-data" && m.pane_id === paneId, "observer replay", 15_000);
+      expect(watched.replay).toBe(true);
+      expect(String(watched.data)).toContain(`${tag}-56`);
+      joiner.close();
+      rejoined = await RecordingSocket.connect(url);
+      rejoined.send({ type: "attach", pane_id: paneId, cols: 100, rows: 30, flow_control: "ack" });
+      const again = await rejoined.waitFor((m) => m.type === "pty-data" && m.pane_id === paneId, "reconnect replay", 15_000);
+      expect(again.replay).toBe(true);
+      operator.send({ type: "input", pane_id: paneId, text: `echo ${tag}-$((8*9))\r` });
+      await rejoined.waitFor(printed(72), "reconnect live output", 15_000);
+      await observer.waitFor(printed(72), "observer live output", 15_000);
+      for (const socket of [observer, rejoined]) {
+        expect(frames(socket).filter((frame) => frame.replay === true)).toHaveLength(1);
+        expect(frames(socket)[0]!.replay).toBe(true);
+        offsetsFollowBytes(socket);
+      }
+    } finally {
+      for (const socket of [operator, joiner, observer, rejoined]) socket?.close();
+    }
+  }, 60_000);
 
   it("leaves the shared pty's size alone for an attach whose grid the chat lens covers", async () => {
     const created = await workspaceCreate({ cwd: tmpdir(), label: "herdr-web-ui-test-keep-size" });
@@ -3455,6 +3817,38 @@ describe("PC management API", () => {
     expect((await fetch(`${base()}/api/machines/missing/pane/read?pane_id=p1`)).status).toBe(503);
     expect((await fetch(`${base()}/api/machines/missing/auth`)).status).toBe(404);
   });
+  it("answers another PC's oversized or unreadable answer with a safe 502", async () => {
+    const secret = "fixture-contract-secret";
+    let serve = () => new Response("{}");
+    const peer = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => serve() });
+    const url = `http://127.0.0.1:${peer.port}`;
+    const manager = { endpoint: (id: string) => id === "capped-remote" ? { url, token: "contract-token" } : undefined, trackTerminal: () => () => {} } as unknown as MachineManager;
+    const ask = (machine: string, path: string, readOnly = false) => handleMachineRequest(new Request(`http://127.0.0.1/api/machines/${machine}/${path}`), manager, undefined, undefined, readOnly);
+    const logged: string[] = [];
+    const error = spyOn(console, "error").mockImplementation((...args: unknown[]) => { logged.push(args.join(" ")); });
+    try {
+      // a watcher's prompt is parsed to remove what it may not see, so it is held to 1 MiB
+      serve = () => new Response(`{"prompt":null,"restored":"${secret}${"x".repeat(1024 * 1024)}"}`);
+      const large = await ask("capped-remote", "pane/prompt?pane_id=p1", true);
+      expect(large.status).toBe(502);
+      const tooLarge = await large.json() as ApiError;
+      expect(tooLarge.error.code).toBe("remote_response_too_large");
+      serve = () => new Response(`{"prompt":{"plan_file":"${secret}"`);
+      const unreadable = await ask("capped-remote", "pane/prompt?pane_id=p1", true);
+      expect(unreadable.status).toBe(502);
+      const invalid = await unreadable.json() as ApiError;
+      expect(invalid.error.code).toBe("remote_response_invalid");
+      for (const text of [JSON.stringify(tooLarge), JSON.stringify(invalid), logged.join("\n")]) {
+        expect(text).not.toContain(secret);
+        expect(text).not.toContain(url);
+        expect(text).not.toContain("contract-token");
+      }
+      // a disconnected PC is refused before any request leaves for it
+      const offline = await ask("missing", "session");
+      expect(offline.status).toBe(503);
+      expect((await offline.json() as ApiError).error.code).toBe("machine_offline");
+    } finally { error.mockRestore(); peer.stop(true); }
+  });
   it("gates PC metadata, setup and SSE behind the existing token", async () => {
     const stateDir = mkdtempSync(join(tmpdir(), "herdr-machine-auth-"));
     const gated = createServer({ port: 0, token: "machine-test-secret", stateDir });
@@ -3626,4 +4020,94 @@ describe("GET /api/sessions/history", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 20_000);
+});
+
+describe("workspace order evidence", () => {
+  /** the first SSE roster whose local snapshot `check` accepts */
+  async function machinesEvent(origin: string, check: (snapshot: SessionSnapshot) => boolean): Promise<SessionSnapshot> {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), 15_000);
+    try {
+      const response = await fetch(`${origin}/api/machines/events`, { signal: abort.signal });
+      const reader = response.body!.pipeThrough(new TextDecoderStream()).getReader();
+      let buffer = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) throw new Error("event stream ended");
+        buffer += value;
+        let end: number;
+        while ((end = buffer.indexOf("\n\n")) >= 0) {
+          const frame = buffer.slice(0, end); buffer = buffer.slice(end + 2);
+          const data = frame.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trim()).join("");
+          if (!data) continue;
+          const event = JSON.parse(data) as { type: string; machines?: { id: string; snapshot: SessionSnapshot | null }[] };
+          const local = event.type === "machines" ? event.machines?.find((machine) => machine.id === "local")?.snapshot : null;
+          if (local && check(local)) return local;
+        }
+      }
+    } finally { clearTimeout(timer); abort.abort(); }
+  }
+
+  it("health, session, websocket and move answers share one order per server lifetime", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdr-web-ui-order-"));
+    const state = join(root, "state");
+    const first = await workspaceCreate({ cwd: root, label: "herdr-web-ui-test-order-first" });
+    const second = await workspaceCreate({ cwd: root, label: "herdr-web-ui-test-order-second" });
+    const managedBoot = process.env["HERDR_WEB_BOOT_ID"];
+    delete process.env["HERDR_WEB_BOOT_ID"];
+    let app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: state });
+    try {
+      let origin = `http://127.0.0.1:${app.port}`;
+      const health = async () => ((await (await fetch(`${origin}/api/health`)).json()) as { web_ui: { boot_id: string } }).web_ui.boot_id;
+      const session = async () => ((await (await fetch(`${origin}/api/session`)).json()) as { snapshot: SessionSnapshot }).snapshot;
+      const move = async (workspaceId: string) => {
+        const response = await fetch(`${origin}/api/workspace/move`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ workspace_id: workspaceId, insert_index: 0 }) });
+        expect(response.status).toBe(200);
+        return response.json();
+      };
+      const boot = await health();
+      expect(boot).toEqual(expect.any(String));
+      // reads never count: two GETs, then the opening websocket snapshot, all at 0
+      expect(await session()).toMatchObject({ order_epoch: boot, read_seq: 0 });
+      expect(await session()).toMatchObject({ order_epoch: boot, read_seq: 0 });
+      const ws = new WebSocket(`ws://127.0.0.1:${app.port}/ws`);
+      const opening = await new Promise<SessionSnapshot>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("no opening snapshot")), 10_000);
+        ws.addEventListener("message", (event) => {
+          const message = JSON.parse(String(event.data)) as { type: string; snapshot?: SessionSnapshot };
+          if (message.type === "snapshot") { clearTimeout(timer); resolve(message.snapshot!); }
+        });
+      });
+      ws.close();
+      expect(opening).toMatchObject({ order_epoch: boot, read_seq: 0 });
+      expect(await move(second.workspace.workspace_id)).toEqual({ ok: true, order_epoch: boot, moved_seq: 1 });
+      expect(await session()).toMatchObject({ order_epoch: boot, read_seq: 1 });
+      const roster = machinesEvent(origin, (snapshot) => (snapshot.read_seq ?? 0) >= 2);
+      expect(await move(first.workspace.workspace_id)).toEqual({ ok: true, order_epoch: boot, moved_seq: 2 });
+      // the move's own roster read follows it: the manager's copy carries the source's pair as read
+      expect(await roster).toMatchObject({ order_epoch: boot, read_seq: 2 });
+      const machines = (await (await fetch(`${origin}/api/machines`)).json()) as { machines: { id: string; source_boot_id?: string }[]; verified_source_boot?: unknown };
+      expect(machines.machines[0]).toMatchObject({ id: "local", source_boot_id: boot });
+      expect(machines.verified_source_boot).toBeUndefined();
+      const verified = await fetch(`${origin}/api/machines?verify_source_boot=local`);
+      expect(verified.status).toBe(200);
+      expect(((await verified.json()) as { verified_source_boot: unknown }).verified_source_boot).toEqual({ machine_id: "local", boot_id: boot });
+      expect((await fetch(`${origin}/api/machines?verify_source_boot=`)).status).toBe(400);
+      expect((await fetch(`${origin}/api/machines?verify_source_boot=nobody`)).status).toBe(404);
+      // a restart is a new epoch, counted again from 0, and health says the same boot
+      app.stop();
+      app = createServer({ port: 0, hostname: "127.0.0.1", token: "", stateDir: state });
+      origin = `http://127.0.0.1:${app.port}`;
+      const restarted = await health();
+      expect(restarted).not.toBe(boot);
+      expect(await session()).toMatchObject({ order_epoch: restarted, read_seq: 0 });
+      expect(await move(second.workspace.workspace_id)).toEqual({ ok: true, order_epoch: restarted, moved_seq: 1 });
+    } finally {
+      app.stop();
+      if (managedBoot === undefined) delete process.env["HERDR_WEB_BOOT_ID"]; else process.env["HERDR_WEB_BOOT_ID"] = managedBoot;
+      await workspaceClose(first.workspace.workspace_id).catch(() => {});
+      await workspaceClose(second.workspace.workspace_id).catch(() => {});
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

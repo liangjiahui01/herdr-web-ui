@@ -17,8 +17,9 @@
   height: 0;
 }
 
-/* the chat lens keeps the masked input in this slot too (PaneTerminal.tsx), in flow: no box */
-.terminal-stack.is-chat > .terminal-input-slot {
+/* the chat lens keeps the masked input in this slot too (PaneTerminal.tsx), in flow: no box. A
+   terminal command's peek over the chat shows the grid, so the slot is the terminal lens's there */
+.terminal-stack.is-chat:not(.is-peek) > .terminal-input-slot {
   display: contents;
 }
 

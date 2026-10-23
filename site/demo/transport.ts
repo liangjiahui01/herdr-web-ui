@@ -9,7 +9,9 @@
  * every chat, the Codex approval card (answering it sets Codex to work and ends the turn), the
  * command palette, settings, and the terminal: the release shell tab replays a recording of `git log` and `bun test`, then a small pretend shell answers what you
  * type. `demo logs` loads fictional retained history for scrolling and search; agent panes show
- * one notice instead of a TUI. A message sent from a chat gets a demo answer.
+ * one notice instead of a TUI, and Claude Code's and omp's draw their empty input row under it (and
+ * the screen a few terminal commands open over it, site/demo/agentScreens.ts). A message sent from
+ * a chat gets a demo answer.
  * What does not: files, images, push and remote PCs, which need a real machine.
  */
 import type { AgentIntegration, AgentStatus, CommandForm, CommandOutcome, ConversationTurn, IntegrationsResponse, Machine, MachineEvent, PaneDirection, PaneFindMatch, PaneFindRequest, PanePlan, PaneResized, PaneSplit, PaneSwapped, PaneZoomed, PendingMessage, PlanStep, PluginActionResult, PluginActions, PluginActionsResponse, PortalStatus, ServerMessage, SessionSnapshot, SlashCommand, TabMoved, UsageReport, WorkspaceCreated, WorkspaceInfo, WorktreeEntry, WorktreeListing, WorktreeOpened, WorktreeRemoved } from "../../shared/protocol.ts";
@@ -17,19 +19,20 @@ import type { RepoDiffFile, RepoDiffFileList, RepoDiffFilePatch, RepoDiffReposit
 import { VOICE_DEFAULTS, type VoiceStatus } from "../../shared/voice.ts";
 import { isAgentName } from "../../shared/agent-name.ts";
 import { skillSyntax } from "../../shared/skill-syntax.ts";
+import { firstMessageFault } from "../../shared/launch-rules.ts";
 import { neighborPane } from "../../src/lib/layoutMap.ts";
 import { closeLayoutPane, resizeLayout, setLayoutSplitRatio, splitLayout, swapLayoutPanes } from "../../src/lib/layoutTree.ts";
 import { rollupStatus } from "../../src/lib/status.ts";
 import { movedTabOrder } from "../../src/lib/tabOrder.ts";
-import { CHATS, PROMPT, SESSION_HISTORY_AGENTS, sessionHistoryRows, SPECS, type DemoSpec } from "./fixtures.ts";
+import { agentSkillRows, CHATS, PROMPT, SESSION_HISTORY_AGENTS, sessionHistoryRows, SPECS, type DemoSpec } from "./fixtures.ts";
 import { DemoHistory } from "./history.ts";
+import { screenAgent, screenCommand, screenFrame } from "./agentScreens.ts";
 import machinesFixture from "./fixtures/machines.json";
 import agentsFixture from "./fixtures/agents.json";
 import commandsFixture from "./fixtures/commands.json";
 import panesFixture from "./fixtures/panes.json";
 import terminalFixture from "./fixtures/terminal.json";
 
-const DEMO_VERSION = "demo";
 /** Only an explicit `demo logs` command starts this fictional retained history. */
 const histories = new Map<string, DemoHistory>();
 const terminalGrids = new Map<string, { cols: number; rows: number }>();
@@ -327,8 +330,167 @@ function conversationChanged(paneId: string): void {
   for (const socket of sockets) socket.push({ type: "conversation-changed", pane_id: paneId, signature: `demo:${revision}` });
 }
 
+// ---- workspace order (server/order-sequence.ts) -------------------------------------------------
+// Each fictional PC's server keeps one move counter per lifetime: a read carries the count when it
+// starts, a confirmed move takes the next number. The regression script holds reads, cached GETs,
+// SSE rosters, move answers and boot proofs apart through `window.__herdrDemoOrder`, so each can
+// arrive in any order; the app itself only ever sees the answers.
+// The roster is the fictional manager's (server/machines.ts): it publishes a PC's snapshot of an
+// epoch only once its own sideband health call proved that epoch (`accepted`), keeps the last one it
+// accepted until then, and names the proved boot in source_boot_id.
+interface DemoOrder { epoch: string; seq: number; legacy: boolean; accepted: string; cached: SessionSnapshot | null }
+const orders = new Map<string, DemoOrder>();
+function orderOf(machineId: string): DemoOrder {
+  let order = orders.get(machineId);
+  if (!order) { const epoch = crypto.randomUUID(); order = { epoch, seq: 0, legacy: false, accepted: epoch, cached: null }; orders.set(machineId, order); }
+  return order;
+}
+/** a PC's roster as its server reads it now: the read's pair is taken when it starts */
+function readSnapshot(machine: Machine): SessionSnapshot | null {
+  if (!machine.snapshot) return null;
+  const order = orderOf(machine.id);
+  return order.legacy ? structuredClone(machine.snapshot) : { ...structuredClone(machine.snapshot), order_epoch: order.epoch, read_seq: order.seq };
+}
+function readRoster(): Machine[] {
+  return machines.map((machine) => {
+    const order = orderOf(machine.id);
+    const { source_boot_id: _proof, ...rest } = machine;
+    if (order.legacy) return { ...rest, snapshot: readSnapshot(machine) };
+    // a restart its manager has not proved yet: the cache keeps the last accepted server's read
+    if (order.epoch !== order.accepted) return { ...rest, snapshot: structuredClone(order.cached), source_boot_id: order.accepted };
+    order.cached = readSnapshot(machine);
+    return { ...rest, snapshot: structuredClone(order.cached), source_boot_id: order.accepted };
+  });
+}
+/** answer: proof with a fresh roster; proof-only: proof whose roster has no entry for the PC yet; refuse: the health call fails */
+type VerifyMode = "answer" | "proof-only" | "hold" | "refuse";
+/** the manager's per-PC health-call admission: one call in flight, starts SOURCE_CHECK_INTERVAL_MS apart */
+interface Admission { inflight: Promise<VerifyMode> | null; lastStart: number | null }
+const admissions = new Map<string, Admission>();
+const admissionOf = (machineId: string): Admission => {
+  let admission = admissions.get(machineId);
+  if (!admission) { admission = { inflight: null, lastStart: null }; admissions.set(machineId, admission); }
+  return admission;
+};
+const orderControl = {
+  /** rosters read now, delivered later by the script */
+  held: [] as Machine[][],
+  /** answers the next GET /api/machines gives instead of a fresh read (a cache that lags) */
+  cachedGets: [] as Machine[][],
+  /** plain GET /api/machines answers wait for releaseGet() while this is set; each is read when it arrives */
+  holdGets: false,
+  gets: [] as (() => void)[],
+  /** moves to let through before the next one is refused (null: none refused) */
+  failAfter: null as number | null,
+  /** the admission's monotonic clock, in ms: only the script moves it */
+  clock: 0,
+  /** SSE rosters wait while this is set: publication is held apart from the move's receipt */
+  holdSse: false,
+  /** move answers wait for release() while this is set */
+  holdMoves: false,
+  moves: [] as (() => void)[],
+  verifyMode: "answer" as VerifyMode,
+  verifies: [] as { machineId: string; release(mode?: VerifyMode): void }[],
+  log: [] as { kind: string; machine_id?: string; epoch?: string; seq?: number; at: number }[],
+};
+function note(kind: string, detail: { machine_id?: string; epoch?: string; seq?: number } = {}): void {
+  orderControl.log.push({ kind, ...detail, at: orderControl.log.length });
+}
+function publishRoster(roster: Machine[] = readRoster()): void {
+  note("publication", { machine_id: local.id, epoch: roster[0]?.snapshot?.order_epoch, seq: roster[0]?.snapshot?.read_seq });
+  emitSse({ type: "machines", machines: roster });
+}
+const unverified = (headers: Record<string, string> = {}) => json({ error: { code: "source_unverified", message: "This PC's server could not be verified now" } }, 503, { "cache-control": "no-store", ...headers });
+/**
+ * GET /api/machines?verify_source_boot=<id>: the PC's boot, asked of its server during this request.
+ * Admitted like the manager's (server/machines.ts sourceCheck): an asker that finds a call in flight
+ * waits for it and is refused, and one within the interval of the last start is refused at once.
+ */
+async function verifySourceBoot(machineId: string): Promise<Response> {
+  if (machineId === "") return error("invalid_query", "verify_source_boot names one PC", 400);
+  const machine = machines.find((candidate) => candidate.id === machineId);
+  if (!machine) return error("machine_not_found", "PC not found", 404);
+  note("verify-request", { machine_id: machineId });
+  const admission = admissionOf(machineId);
+  if (admission.inflight) {
+    await admission.inflight;
+    note("verify-joined", { machine_id: machineId });
+    return unverified();
+  }
+  if (admission.lastStart !== null && orderControl.clock - admission.lastStart < 1000) {
+    note("verify-interval", { machine_id: machineId });
+    return unverified({ "retry-after": "1" });
+  }
+  admission.lastStart = orderControl.clock;
+  note("verify-start", { machine_id: machineId });
+  const call = orderControl.verifyMode === "hold"
+    ? new Promise<VerifyMode>((resolve) => { orderControl.verifies.push({ machineId, release: (next = "answer") => resolve(next) }); })
+    : Promise.resolve(orderControl.verifyMode);
+  admission.inflight = call;
+  const mode = await call;
+  admission.inflight = null;
+  const order = orderOf(machineId);
+  note(`verify-${mode}`, { machine_id: machineId, epoch: order.epoch });
+  if (mode === "refuse" || order.legacy) return unverified();
+  // the health call proved the server that answers now: the manager accepts its epoch
+  order.accepted = order.epoch;
+  const roster = readRoster();
+  return json({ machines: mode === "proof-only" ? roster.filter((candidate) => candidate.id !== machineId) : roster, verified_source_boot: { machine_id: machineId, boot_id: order.epoch } }, 200, { "cache-control": "no-store" });
+}
+(window as unknown as { __herdrDemoOrder: unknown }).__herdrDemoOrder = {
+  /** a roster read now, for later delivery; its index */
+  hold: () => orderControl.held.push(readRoster()) - 1,
+  deliverSse: (index: number) => { const roster = orderControl.held[index]!; note("publication", { machine_id: local.id, epoch: roster[0]?.snapshot?.order_epoch, seq: roster[0]?.snapshot?.read_seq }); emitSse({ type: "machines", machines: roster }); },
+  cacheNextGet: (index: number) => { orderControl.cachedGets.push(orderControl.held[index]!); },
+  holdSse: (on: boolean) => { orderControl.holdSse = on; },
+  publish: () => publishRoster(),
+  holdMoves: (on: boolean) => { orderControl.holdMoves = on; },
+  releaseMove: () => { orderControl.moves.shift()?.(); },
+  /** stop holding move answers and answer every held one */
+  releaseAllMoves: () => { orderControl.holdMoves = false; for (const release of orderControl.moves.splice(0)) release(); },
+  pendingMoves: () => orderControl.moves.length,
+  verifyMode: (mode: VerifyMode) => { orderControl.verifyMode = mode; },
+  releaseVerify: (mode?: VerifyMode) => { orderControl.verifies.shift()?.release(mode); },
+  pendingVerifies: () => orderControl.verifies.length,
+  /** the PC's server restarts: a new epoch, counted from 0 again, which its manager has not proved yet */
+  restart: (machineId = local.id) => { const order = orderOf(machineId); order.epoch = crypto.randomUUID(); order.seq = 0; return order.epoch; },
+  /** the manager's own sideband health call proves the PC's current server: passive proof only */
+  proveSource: (machineId = local.id) => { const order = orderOf(machineId); order.accepted = order.epoch; note("sideband-proof", { machine_id: machineId, epoch: order.epoch }); },
+  /** move the admission clock on */
+  advance: (ms: number) => { orderControl.clock += ms; },
+  holdGets: (on: boolean) => { orderControl.holdGets = on; },
+  /** answer the oldest held GET /api/machines */
+  releaseGet: () => { orderControl.gets.shift()?.(); },
+  releaseAllGets: () => { orderControl.holdGets = false; for (const release of orderControl.gets.splice(0)) release(); },
+  pendingGets: () => orderControl.gets.length,
+  /** let `skip` moves through, then refuse the next one without moving anything */
+  failMove: (skip = 0) => { orderControl.failAfter = skip; },
+  /** the PC's server is one from before order evidence: no pairs, no receipts' numbers, no proof */
+  legacy: (on: boolean, machineId = local.id) => { orderOf(machineId).legacy = on; },
+  /** another client moves a workspace: herdr's order and the counter change, nothing is published */
+  otherClientMove: (workspaceId: string, insertIndex: number) => {
+    const snap = snapshot();
+    const order = movedTabOrder(snap.workspaces.map((workspace) => workspace.workspace_id), workspaceId, insertIndex);
+    if (order) snap.workspaces.sort((a, b) => order.indexOf(a.workspace_id) - order.indexOf(b.workspace_id));
+    snap.workspaces.forEach((workspace, index) => { workspace.number = index + 1; });
+    orderOf(local.id).seq++;
+  },
+  /** a second fictional PC, with its own server and order */
+  addPc: () => {
+    if (machines.some((machine) => machine.id === "laptop")) return "laptop";
+    machines.push({ ...structuredClone(local), id: "laptop", name: "laptop", kind: "ssh" } as Machine);
+    publishRoster();
+    return "laptop";
+  },
+  /** a pane's status patch on the local PC: no full roster */
+  status: (paneId: string, status: AgentStatus) => setStatus(paneId, status),
+  epoch: (machineId = local.id) => orderOf(machineId).epoch,
+  seq: (machineId = local.id) => orderOf(machineId).seq,
+  log: () => orderControl.log,
+};
+
 function structureChanged(): void {
-  emitSse({ type: "machines", machines });
+  if (!orderControl.holdSse) publishRoster();
   emitSse({ type: "machine-message", machine_id: local.id, message: { type: "session-changed" } });
   for (const socket of sockets) socket.push({ type: "session-changed" });
 }
@@ -398,9 +560,19 @@ const CLAUDE_LATER: SlashCommand[] = [
   { name: "context", description: "Show how the context window is used", source: "builtin", forms: [{ match: "bare", interaction: "none" }] },
 ];
 
-/** GET /api/pane/commands: the recorded Claude list, with its forms for a Claude pane. */
+/**
+ * omp's terminal screens the demo draws (site/demo/agentScreens.ts), as server/skills/omp.ts
+ * describes them: /settings opens a panel over the editor, /copy prints in an empty session.
+ */
+const OMP_TERMINAL: SlashCommand[] = [
+  { name: "settings", description: "Open the settings", source: "builtin", forms: [{ match: "bare", interaction: "terminal" }, { match: "other", interaction: "terminal" }] },
+  { name: "copy", description: "Copy the last answer", source: "builtin", forms: [{ match: "bare", interaction: "terminal" }, { match: "other", interaction: "terminal" }] },
+];
+
+/** GET /api/pane/commands: the recorded Claude list, with its forms for a Claude pane (and omp's terminal screens for an omp pane). */
 function paneCommandRows(paneId: string): SlashCommand[] {
   const rows = (commandsFixture as { commands: SlashCommand[] }).commands;
+  if (agentOf(paneId) === "omp") return [...rows, ...OMP_TERMINAL.map((row) => ({ ...row, provenance: { transport: "static" as const, verified: false }, id: row.name }))];
   if (agentOf(paneId) !== "claude") return rows;
   const described = rows.map((row) => {
     const forms = CLAUDE_FORMS[row.name];
@@ -467,11 +639,107 @@ function terminalPreview(paneId: string, text: string, name: string): string {
 
 const now = () => new Date().toISOString();
 
+/**
+ * What Claude Code records when one of its panels closes (a `local_command` answer, which the chat
+ * reads as a local-command notice), for the demo's terminal commands, as Claude Code 2.1.306 wrote
+ * them. A command whose close leaves no record (`/doctor` here) is not listed: its terminal stays
+ * until the reader leaves it.
+ */
+const CLAUDE_PANEL_CLOSED: Record<string, string> = {
+  config: "Config dialog dismissed", status: "Settings dialog dismissed", cost: "Settings dialog dismissed", help: "Help dialog dismissed",
+};
+/** the panel a terminal command left open in each Claude pane, by what its close records */
+const openPanels = new Map<string, string>();
+
+/** Escape typed into a Claude pane closes the panel a terminal command opened, and Claude records that it did. */
+function closeClaudePanel(paneId: string, text: string): void {
+  const closed = openPanels.get(paneId);
+  const chat = chats.get(keyOfPane.get(paneId) ?? "");
+  if (closed === undefined || chat === undefined || text !== "\x1b") return;
+  openPanels.delete(paneId);
+  chat.turns.push({ role: "user", ts: now(), parts: [{ kind: "notice", text: closed, source: "local-command" }] });
+  conversationChanged(paneId);
+}
+
+/** what a Claude or omp pane's screen shows over its input row (site/demo/agentScreens.ts), by pane */
+const agentScreens = new Map<string, { open: { name: string; text: string } | null; printed: string | null }>();
+const screenOf = (paneId: string) => agentScreens.get(paneId) ?? { open: null, printed: null };
+
+/** the pane's screen drawn again for its grid, to every terminal attached to it */
+function drawAgentScreen(paneId: string): void {
+  for (const socket of sockets) socket.drawScreen(paneId);
+}
+
+/** A terminal command that opens a screen in the demo's Claude or omp pane, or prints over its input row. */
+function openAgentScreen(paneId: string, text: string, name: string): void {
+  const agent = screenAgent(agentOf(paneId));
+  const effect = agent === null ? null : screenCommand(agent, name);
+  if (effect === null) return;
+  agentScreens.set(paneId, effect === "open" ? { open: { name, text }, printed: null } : { open: null, printed: "Nothing to copy yet." });
+  drawAgentScreen(paneId);
+}
+
+/** Escape typed into such a pane closes the screen (or clears the line printed over the row), and the row comes back. */
+function closeAgentScreen(paneId: string, text: string): void {
+  if (text !== "\x1b" || screenAgent(agentOf(paneId)) === null) return;
+  const screen = screenOf(paneId);
+  if (screen.open === null && screen.printed === null) return;
+  agentScreens.set(paneId, { open: null, printed: null });
+  drawAgentScreen(paneId);
+}
+
 /** The bridge takes one accepted pending message when the current mock turn finishes. */
+/**
+ * The first messages create requests queued for new panes' agents (`first_message`), by pane, as the
+ * bridge keeps them: told to every socket attached to the pane, typed into the chat once when the
+ * agent is first ready through the socket that asked (`first_message_connection`) while it is
+ * attached, held once that socket closes first or when none was named, and discarded or sent now
+ * through pending-action by any attached socket.
+ */
+const firstMessages = new Map<string, PendingMessage>();
+/** the connection that asked for each pane's first message */
+const firstRequesters = new Map<string, string>();
+let nextFirst = 1;
+let nextConnection = 1;
+const FIRST_MESSAGE_UNATTENDED = { code: "first_message_unattended", message: "The page that sent this first message is gone; send it now or discard it" };
+
+function queueFirstMessage(paneId: string, text: string, requester: unknown): PendingMessage {
+  const asked = typeof requester === "string" && [...sockets].some((socket) => socket.connection === requester);
+  const message: PendingMessage = { id: `demo-first-${nextFirst}`, request_id: -nextFirst, text, state: asked ? "queued" : "held",
+    created_at: now(), ...(asked ? {} : { error: { ...FIRST_MESSAGE_UNATTENDED } }) };
+  nextFirst += 1;
+  firstMessages.set(paneId, message);
+  if (asked) firstRequesters.set(paneId, requester as string); else firstRequesters.delete(paneId);
+  publishFirstMessage(paneId);
+  return message;
+}
+
+function publishFirstMessage(paneId: string, removed?: { id: string; outcome: "sent" | "discarded" }[]): void {
+  const message = firstMessages.get(paneId);
+  for (const socket of sockets) if (socket.attachedTo(paneId)) socket.push({ type: "pending-messages", pane_id: paneId, messages: message ? [structuredClone(message)] : [], ...(removed ? { removed } : {}) });
+}
+
+/**
+ * The pane's first message typed into its chat: on its own (`by` null) only while it waits and the socket that
+ * asked is attached; on a socket's Send now (`by`) when that socket is attached. False when it was not typed.
+ */
+function deliverFirstMessage(paneId: string, by: DemoSocket | null = null): boolean {
+  const message = firstMessages.get(paneId);
+  if (!message) return false;
+  if (by === null ? message.state !== "queued" || ![...sockets].some((socket) => socket.connection === firstRequesters.get(paneId) && socket.attachedTo(paneId))
+    : !by.attachedTo(paneId)) return false;
+  firstMessages.delete(paneId);
+  firstRequesters.delete(paneId);
+  submitToChat(paneId, message.text);
+  publishFirstMessage(paneId, [{ id: message.id, outcome: "sent" }]);
+  return true;
+}
+
 function finishDemoTurn(paneId: string, status: "idle" | "done" = "done"): void {
   replying.delete(paneId);
   if (!paneOf(paneId)) return;
   setStatus(paneId, status);
+  if (deliverFirstMessage(paneId)) return;
   for (const socket of [...sockets].sort((a, b) => a.pendingOrder(paneId) - b.pendingOrder(paneId))) {
     if (socket.drainPending(paneId)) break;
   }
@@ -490,6 +758,9 @@ function submitToChat(paneId: string, text: string): void {
   const command = sentCommand(paneId, text);
   if (command?.form?.interaction === "terminal") {
     const outcome = recordOutcome(paneId, text, "terminal-required");
+    const closes = agentOf(paneId) === "claude" ? CLAUDE_PANEL_CLOSED[command.name] : undefined;
+    if (closes !== undefined) openPanels.set(paneId, closes); else openPanels.delete(paneId);
+    openAgentScreen(paneId, text, command.name);
     setTimeout(() => { outcome.preview = terminalPreview(paneId, text, command.name); outcome.updated_at = now(); }, OUTCOME_PREVIEW_MS);
     return;
   }
@@ -658,6 +929,20 @@ const PLUGINS: PluginActions[] = [
   ] },
 ];
 
+const NO_PORTAL: PortalStatus = { supported: false, version: null, min_version: "v2.6.1", usable: false, phase: "idle", relay: null, url: null, blocked: null, error: null, output: null };
+/**
+ * The demo opens no public address, so its Portal section stays hidden. A QA script may stage a
+ * fictional status (a recovering Portal, say) as JSON in sessionStorage["herdr-web-ui:demo-portal"]
+ * before the app loads; starting and stopping stay refused either way.
+ */
+function demoPortal(): PortalStatus {
+  try {
+    const staged = window.sessionStorage.getItem("herdr-web-ui:demo-portal");
+    if (staged !== null) return { ...NO_PORTAL, supported: true, ...(JSON.parse(staged) as Partial<PortalStatus>) };
+  } catch { /* storage blocked or not JSON: the section stays hidden */ }
+  return NO_PORTAL;
+}
+
 async function route(url: URL, method: string, init: RequestInit | undefined, input: RequestInfo | URL): Promise<Response> {
   const path = url.pathname;
   const query = url.searchParams;
@@ -666,10 +951,18 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
   if (path === "/api/health") {
     const auth = { required: false, authenticated: true };
     if (query.get("scope") === "bridge") return json({ ok: true, auth, bridge_protocol: 1 });
-    return json({ ok: true, herdr: { version: "0.9.0", protocol: 22, terminal_attach: true }, auth, web_ui: { boot_id: DEMO_VERSION, revision: null } });
+    return json({ ok: true, herdr: { version: "0.9.0", protocol: 22, terminal_attach: true }, auth, web_ui: { boot_id: orderOf(local.id).epoch, revision: null } });
   }
-  if (path === "/api/machines") return json({ machines });
-  if (path === "/api/session") return json({ snapshot: snapshot() });
+  if (path === "/api/machines") {
+    const asked = query.getAll("verify_source_boot");
+    if (asked.length > 1) return error("invalid_query", "verify_source_boot names one PC", 400);
+    if (asked.length === 1) return verifySourceBoot(asked[0]!);
+    note("read-start", { machine_id: local.id, epoch: orderOf(local.id).epoch, seq: orderOf(local.id).seq });
+    const roster = orderControl.cachedGets.shift() ?? readRoster();
+    if (orderControl.holdGets) await new Promise<void>((resolve) => orderControl.gets.push(resolve));
+    return json({ machines: roster });
+  }
+  if (path === "/api/session") return json({ snapshot: readSnapshot(local) });
   if (path === "/api/agents") return json(agentsFixture);
   if (path === "/api/integrations") return json({ integrations: integrationsFixture } satisfies IntegrationsResponse);
   if (path === "/api/updates") return json({ managed: false, auto_update: false, phase: "idle", current_revision: null, latest_revision: null, current_version: __APP_VERSION__, latest_version: null, available: false, checked_at: null, blocked_reason: null, error: null }, 200, { "cache-control": "no-store" });
@@ -683,8 +976,7 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
   if (path === "/api/seen") return method === "POST" ? new Response(null, { status: 204 }) : json({ finishes: [] }, 200, { "cache-control": "no-store" });
   if (path === "/api/telemetry") return json({ error: { code: "not_found", message: "This server sends no telemetry" } }, 404, { "cache-control": "no-store" });
   if (path === "/api/herdr/update") return json({ supported: false, phase: "idle", server_version: null, binary_version: null, stale: false, output: null, finished_at: null }, 200, { "cache-control": "no-store" });
-  // the demo opens no public address: the Portal section stays hidden
-  if (path === "/api/portal") return json({ supported: false, version: null, min_version: "v2.6.1", usable: false, phase: "idle", relay: null, url: null, blocked: null, error: null, output: null } satisfies PortalStatus, 200, { "cache-control": "no-store" });
+  if (path === "/api/portal") return json(demoPortal(), 200, { "cache-control": "no-store" });
   if (path === "/api/portal/start" || path === "/api/portal/stop") return error("portal_unsupported", "The demo opens no public address.", 409);
   if (path === "/api/access") return json({ port: 7317, tailscale: { state: "running", dns_name: "workstation.example.ts.net", serving_url: "https://workstation.example.ts.net", serve_command: null, serve_url: null } });
   if (path === "/api/usage") return json(usageReport(), 200, { "cache-control": "no-store" });
@@ -811,6 +1103,16 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
     return json({ ok: true });
   }
   if (path === "/api/pane/commands") return json({ commands: paneCommandRows(paneId) });
+  // an agent's commands in a folder before any pane runs it: the new workspace and tab dialogs' skill
+  // chips. The static rows the bridge would read for the agent are not bundled here; the skills are
+  if (path === "/api/agent/commands") {
+    if (method !== "GET") return error("method_not_allowed", "use GET", 400);
+    const agent = query.get("agent") ?? "";
+    if (agent === "") return error("missing_agent", "agent query parameter is required", 400);
+    const cwd = query.get("cwd") ?? "";
+    if (cwd !== "" && !cwd.startsWith("/home/demo") && !cwd.startsWith("~")) return error("invalid_cwd", "cwd must be an existing directory", 400);
+    return json({ commands: agentSkillRows(agent) });
+  }
   if (path === "/api/pane/scroll") {
     const body = method === "POST" ? await bodyOf(init, input) : {};
     const target = method === "POST" ? String(body["pane_id"] ?? "") : paneId;
@@ -1130,12 +1432,22 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
     const snap = snapshot();
     const workspace = snap.workspaces.find((w) => w.workspace_id === body["workspace_id"]);
     if (!workspace) return error("not_found", "no such workspace", 404);
+    if (orderControl.failAfter !== null && orderControl.failAfter-- === 0) {
+      orderControl.failAfter = null;
+      note("move-refused", { machine_id: local.id });
+      return error("herdr_error", "herdr refused the move", 500);
+    }
     const ids = snap.workspaces.map((workspace) => workspace.workspace_id);
     const order = movedTabOrder(ids, workspace.workspace_id, Number(body["insert_index"] ?? 0));
     if (order) snap.workspaces.sort((a, b) => order.indexOf(a.workspace_id) - order.indexOf(b.workspace_id));
     snap.workspaces.forEach((w, i) => { w.number = i + 1; });
+    // confirmed: the receipt's number is taken before anything else waits
+    const counter = orderOf(local.id);
+    const receipt = { order_epoch: counter.epoch, moved_seq: ++counter.seq };
+    note("move", { machine_id: local.id, epoch: receipt.order_epoch, seq: receipt.moved_seq });
     structureChanged();
-    return json({ ok: true });
+    if (orderControl.holdMoves) await new Promise<void>((resolve) => orderControl.moves.push(resolve));
+    return json(counter.legacy ? { ok: true } : { ok: true, ...receipt });
   }
   if (path === "/api/workspace/directories" && method === "POST") {
     // New folder: the demo has no disk, so the folder opens empty and is not listed again
@@ -1152,11 +1464,14 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
   if (path === "/api/workspace/create") {
     const body = await bodyOf(init, input);
     const agent = (body["agent"] as { kind?: string } | null | undefined)?.kind ?? null;
+    const firstFault = firstMessageFault(body["first_message"], agent);
+    if (firstFault !== null) return error("invalid_first_message", firstFault, 400);
     const cwd = String(body["cwd"] ?? "/home/demo/new-project");
     const label = String(body["label"] ?? "") || cwd.split("/").pop() || "new";
     const made = createDemoWorkspace(cwd, label, agent);
     structureChanged();
-    return json(made);
+    if (typeof body["first_message"] !== "string") return json(made);
+    return json({ ...made, first_message: made.agent_started ? { id: queueFirstMessage(made.pane_id, body["first_message"], body["first_message_connection"]).id } : null });
   }
   if (path === "/api/tab/create") {
     const body = await bodyOf(init, input);
@@ -1165,6 +1480,8 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
     if (!workspace) return error("not_found", "no such workspace", 404);
     const launch = body["agent"] as { kind?: string; args?: unknown } | null | undefined;
     const agent = launch?.kind ?? null;
+    const firstFault = firstMessageFault(body["first_message"], agent);
+    if (firstFault !== null) return error("invalid_first_message", firstFault, 400);
     // a session resumed from the history dialog (`codex resume <id>`, `claude --resume <id>`: the id
     // last) is the one the new pane shows, as herdr reports a pane's session
     const resumed = agent !== null && Array.isArray(launch?.args) && launch.args.length === 2 && typeof launch.args[1] === "string" ? launch.args[1] : null;
@@ -1193,7 +1510,9 @@ async function route(url: URL, method: string, init: RequestInit | undefined, in
       setTimeout(() => { if (!replying.has(pane.pane_id)) finishDemoTurn(pane.pane_id, "idle"); }, 1500);
     }
     structureChanged();
-    return json({ workspace_id: id, pane_id: pane.pane_id, agent_started: agent !== null } satisfies WorkspaceCreated);
+    const made: WorkspaceCreated = { workspace_id: id, pane_id: pane.pane_id, agent_started: agent !== null };
+    if (typeof body["first_message"] !== "string") return json(made);
+    return json({ ...made, first_message: agent !== null ? { id: queueFirstMessage(pane.pane_id, body["first_message"], body["first_message_connection"]).id } : null });
   }
   // no key in the demo: the app falls back to the browser's own speech recognition
   if (path === "/api/voice") return json({ configured: false, source: null, ...VOICE_DEFAULTS } satisfies VoiceStatus, 200, { "cache-control": "no-store" });
@@ -1246,7 +1565,7 @@ class DemoEventSource extends EventTarget {
     super();
     this.url = url;
     sseListeners.add(this.listener);
-    setTimeout(() => { this.onopen?.(new Event("open")); this.listener(new MessageEvent("message", { data: JSON.stringify({ type: "machines", machines } satisfies MachineEvent) })); }, 30);
+    setTimeout(() => { this.onopen?.(new Event("open")); this.listener(new MessageEvent("message", { data: JSON.stringify({ type: "machines", machines: readRoster() } satisfies MachineEvent) })); }, 30);
   }
   close(): void { this.readyState = 2; sseListeners.delete(this.listener); }
 }
@@ -1265,6 +1584,11 @@ const NOTICE_LINES = [
   "live through herdr terminal attach and shared with",
   "the herdr TUI on the PC. Switch back to Chat above.",
 ];
+/** the notice's box as plain rows, for the screens that draw an agent's input row under it */
+const NOTICE_BOX = (() => {
+  const width = Math.max(...NOTICE_LINES.map((line) => line.length)) + 4;
+  return [`┌${"─".repeat(width)}┐`, ...NOTICE_LINES.map((line) => `│  ${line.padEnd(width - 4)}  │`), `└${"─".repeat(width)}┘`];
+})();
 const NOTICE = (() => {
   const width = Math.max(...NOTICE_LINES.map((line) => line.length)) + 4;
   const amber = (text: string) => `\x1b[38;5;214m${text}\x1b[0m`;
@@ -1302,6 +1626,8 @@ const SHELL_COMMANDS: Record<string, string> = {
 };
 
 class DemoSocket extends EventTarget {
+  /** this socket's id, told in its snapshot: a create request names it as its first message's typist */
+  readonly connection = `demo-connection-${nextConnection++}`;
   static readonly CONNECTING = 0; static readonly OPEN = 1; static readonly CLOSING = 2; static readonly CLOSED = 3;
   readonly url: string;
   readyState = 0;
@@ -1312,6 +1638,8 @@ class DemoSocket extends EventTarget {
   onerror: ((event: Event) => void) | null = null;
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private readonly attached = new Set<string>();
+  /** whether this socket has the pane attached: the bridge's first message is told to, and typed through, such a socket */
+  attachedTo(paneId: string): boolean { return this.attached.has(paneId); }
   private mode: "interact" | "observe" = "interact";
   /** Accepted messages belong to this live connection, never to a reconnect's empty queue. */
   private readonly pending = new Map<string, PendingMessage[]>();
@@ -1333,7 +1661,7 @@ class DemoSocket extends EventTarget {
       const open = new Event("open");
       this.onopen?.(open);
       this.dispatchEvent(open);
-      this.push({ type: "snapshot", snapshot: snapshot(), features: ["submit", "pending-input", "pending-hold", "secret-input", "input-ready", "conversation-watch", "ping"] });
+      this.push({ type: "snapshot", snapshot: readSnapshot(local)!, features: ["submit", "pending-input", "pending-hold", "secret-input", "input-ready", "conversation-watch", "ping"], connection: this.connection });
     }, 20);
     this.timers.add(opening);
   }
@@ -1436,6 +1764,7 @@ class DemoSocket extends EventTarget {
         if (message.pane_id) {
           this.attached.delete(message.pane_id);
           this.holdPending(message.pane_id, "not_attached", "This pane was detached. Pending messages will not be sent automatically.");
+          this.holdAsked(message.pane_id);
           this.conversationInterests.delete(message.pane_id);
         }
         break;
@@ -1453,7 +1782,12 @@ class DemoSocket extends EventTarget {
         }
         break;
       // a Stop (`stop`) is typed like any key: the demo has no pty for a following message to overtake
-      case "input": if (message.pane_id && message.text !== undefined) this.typed(message.pane_id, message.text); break;
+      case "input":
+        if (message.pane_id && message.text !== undefined) {
+          if (this.mode === "interact") { closeClaudePanel(message.pane_id, message.text); closeAgentScreen(message.pane_id, message.text); }
+          this.typed(message.pane_id, message.text);
+        }
+        break;
       case "keys": if (message.pane_id) for (const key of message.keys ?? []) this.typed(message.pane_id, chordText(key)); break;
       case "secret":
         if (message.id !== undefined && message.pane_id) this.push({ type: "secret-result", id: message.id, pane_id: message.pane_id, ok: false, code: "prompt_changed" });
@@ -1521,6 +1855,18 @@ class DemoSocket extends EventTarget {
             result(false, "invalid_pending_action"); break;
           }
           if (this.mode === "observe") { result(false, "read_only"); break; }
+          const first = firstMessages.get(message.pane_id);
+          if (first && first.id === message.pending_id && this.attached.has(message.pane_id)) {
+            // the pane's first message is every attached socket's to discard or send now
+            if (message.action === "discard") {
+              firstMessages.delete(message.pane_id);
+              publishFirstMessage(message.pane_id, [{ id: first.id, outcome: "discarded" }]);
+              result(true);
+            // read before the send, which sets the pane working: at rest it goes, otherwise nothing is sent
+            } else if (!["idle", "done"].includes(paneOf(message.pane_id)?.agent_status ?? "")) result(false, "agent_blocked");
+            else result(deliverFirstMessage(message.pane_id, this));
+            break;
+          }
           const pending = this.pending.get(message.pane_id)?.find((item) => item.id === message.pending_id);
           if (!pending) {
             const receipt = this.outcomes.get(message.pending_id);
@@ -1654,11 +2000,35 @@ class DemoSocket extends EventTarget {
       for (const socket of sockets) if (socket === this || socket.attached.has(paneId)) socket.push({ type: "pane-geometry", pane_id: paneId, cols: cols!, rows: rows! });
     }
     if (histories.get(paneId)?.resize(cols!, rows!)) redrawHistory(paneId);
+    // like herdr: its own frame of the pane for the new grid first (the screen it holds, reflowed),
+    // then the agent's redraw; the browser takes no screen change from the first (src/lib/inputRow.ts FrameGate)
+    else if (before?.cols !== cols || before?.rows !== rows) { drawAgentScreen(paneId); drawAgentScreen(paneId); }
   }
 
-  renderHistory(paneId: string): void {
+  /** the pane's agent screen, when it draws one, for the pane's grid; `replay`: the screen a new attach is handed */
+  drawScreen(paneId: string, replay = false): void {
+    const agent = screenAgent(agentOf(paneId));
+    if (agent === null || !this.attached.has(paneId) || histories.has(paneId)) return;
+    const grid = demoGrid(paneId);
+    const screen = screenOf(paneId);
+    this.push({ type: "pty-data", pane_id: paneId, data: screenFrame(agent, NOTICE_BOX, screen.printed, screen.open, grid.cols, grid.rows), ...(replay ? { replay: true as const } : {}) });
+  }
+
+  /** `replay`: the screen a new attach is handed, as the bridge marks its replay */
+  renderHistory(paneId: string, replay = false): void {
     const history = histories.get(paneId);
-    if (history && this.attached.has(paneId)) this.push({ type: "pty-data", pane_id: paneId, data: history.render() });
+    if (history && this.attached.has(paneId)) this.push({ type: "pty-data", pane_id: paneId, data: history.render(), ...(replay ? { replay: true as const } : {}) });
+  }
+
+  /** The first messages this socket asked for, in `paneId` or every pane, that have not gone: held for an explicit send, as the bridge holds them when their page leaves. */
+  private holdAsked(paneId?: string): void {
+    for (const [pane, requester] of firstRequesters) {
+      const first = firstMessages.get(pane);
+      if (requester !== this.connection || (paneId !== undefined && pane !== paneId) || first?.state !== "queued") continue;
+      first.state = "held"; first.error = { ...FIRST_MESSAGE_UNATTENDED };
+      firstRequesters.delete(pane);
+      publishFirstMessage(pane);
+    }
   }
 
   private attach(paneId: string): void {
@@ -1672,8 +2042,17 @@ class DemoSocket extends EventTarget {
     this.attached.add(paneId);
     this.publishPending(paneId);
     this.push({ type: "input-ready", pane_id: paneId });
+    // the bridge's first message for the pane, told to this attaching socket; a pane already at rest gets it typed now.
+    // On its own tick: an attach sent in the open handler is answered here before this socket's snapshot goes out,
+    // and the client takes pending messages only after the snapshot, as a real bridge sends them
+    this.later(() => {
+      const first = firstMessages.get(paneId);
+      if (!first || !this.attached.has(paneId)) return;
+      this.push({ type: "pending-messages", pane_id: paneId, messages: [structuredClone(first)] });
+      if (["idle", "done"].includes(paneOf(paneId)?.agent_status ?? "")) deliverFirstMessage(paneId);
+    }, 0);
     const key = keyOfPane.get(paneId);
-    if (histories.has(paneId)) { this.renderHistory(paneId); return; }
+    if (histories.has(paneId)) { this.renderHistory(paneId, true); return; }
     if (key === "shell") {
       let at = 0;
       let previous = 0;
@@ -1686,10 +2065,11 @@ class DemoSocket extends EventTarget {
     }
     if (pane && !pane.agent && !chats.has(paneId)) {
       // a shell the demo user started: an empty prompt
-      this.later(() => { if (this.attached.has(paneId) && !histories.has(paneId)) this.push({ type: "pty-data", pane_id: paneId, data: "\x1b[2J\x1b[H" + PROMPT_TEXT }); }, 60);
+      this.later(() => { if (this.attached.has(paneId) && !histories.has(paneId)) this.push({ type: "pty-data", pane_id: paneId, data: "\x1b[2J\x1b[H" + PROMPT_TEXT, replay: true }); }, 60);
       return;
     }
-    this.later(() => this.push({ type: "pty-data", pane_id: paneId, data: NOTICE }), 60);
+    if (screenAgent(agentOf(paneId)) !== null) this.later(() => this.drawScreen(paneId, true), 60);
+    else this.later(() => this.push({ type: "pty-data", pane_id: paneId, data: NOTICE, replay: true }), 60);
   }
 
   /** the pretend shell: echo, backspace, and a few commands it knows */
@@ -1741,6 +2121,7 @@ class DemoSocket extends EventTarget {
     if (this.readyState >= 2) return;
     this.readyState = 3;
     this.holdPending();
+    this.holdAsked();
     for (const timer of this.timers) clearTimeout(timer);
     sockets.delete(this);
     this.attached.clear();

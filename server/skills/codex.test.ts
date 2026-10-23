@@ -1,9 +1,11 @@
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, spyOn } from "bun:test";
+import * as nodeFs from "node:fs";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, win32 } from "node:path";
 import { paneCommands } from "../commands.ts";
 import { adminSkillsRoot, source } from "./codex.ts";
+import { MAX_WALK_FOLDERS } from "./walk.ts";
 import type { CommandForm } from "../../shared/protocol.ts";
 
 // Copied from codex-rs/tui/src/slash_command.rs at rust-v0.163.0 (commit 83086188ae0614bd882818ff1aa23f3194962012):
@@ -161,7 +163,10 @@ describe("Codex skill discovery", () => {
   it("offers the nine former exclusions and the other TUI-only screens as terminal-bound builtins", () => {
     const former = ["resume", "permissions", "agents", "hooks", "mcp", "plugins", "skills", "voice", "theme"];
     const screens = ["config", "setup-default-sandbox"];
-    expect([...(source.terminalBound ?? [])].sort()).toEqual([...former, ...screens].sort());
+    // a picker, view, confirmation or prompt whatever follows the name, or a composer Chat no longer drives
+    const held = ["keymap", "experimental", "approve", "memories", "import", "new", "archive", "delete", "fork", "worktree", "side", "btw",
+      "copy", "tui", "mention", "daemon", "warnings", "cd", "usage", "title", "statusline", "pets", "feedback", "subagents", "vim", "logout"];
+    expect([...(source.terminalBound ?? [])].sort()).toEqual([...former, ...screens, ...held].sort());
     for (const name of source.terminalBound ?? []) expect(source.builtins).toContain(name);
     expect(source.builtins).not.toContain("help");
   });
@@ -173,6 +178,9 @@ describe("Codex skill discovery", () => {
       pwd: [{ match: "bare", interaction: "terminal" }], ps: [{ match: "bare", interaction: "terminal" }],
       mcp: [{ match: "bare", interaction: "terminal" }],
       init: [{ match: "bare", interaction: "none" }], compact: [{ match: "bare", interaction: "none" }],
+      rename: [{ match: "bare", interaction: "terminal" }, { match: "other", interaction: "none" }],
+      export: [{ match: "bare", interaction: "terminal" }, { match: "other", interaction: "none" }],
+      goal: [{ match: "bare", interaction: "unknown" }, { match: { sub: "edit" }, interaction: "terminal" }, { match: "other", interaction: "unknown" }],
     });
   });
 
@@ -327,4 +335,23 @@ describe("Codex skill identity", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ source: "skill", trigger: "$", id: realpathSync(join(home, ".codex", "skills", "aliased", "SKILL.md")) });
   });
+});
+
+it("resolves at most a walk's folder budget in a folder whose skill links fan out, as GET /api/agent/commands lets any folder be named", () => {
+  const root = mkdtempSync(join(tmpdir(), "codex-skill-fanout-"));
+  const folder = join(root, "proj");
+  mkdirSync(join(folder, ".git"), { recursive: true });
+  // twelve folders, each with five links to the next: no link closes a cycle, yet the paths through them multiply
+  const base = join(folder, ".agents", "skills");
+  const levels = Array.from({ length: 12 }, (_, depth) => join(base, `level${depth}`));
+  for (const level of levels) mkdirSync(level, { recursive: true });
+  for (let depth = 0; depth + 1 < levels.length; depth++) for (let link = 0; link < 5; link++) symlinkSync(levels[depth + 1]!, join(levels[depth]!, `link${link}`));
+  const resolved = spyOn(nodeFs, "realpathSync");
+  try {
+    paneCommands("codex", folder, join(root, "home"));
+    expect(resolved.mock.calls.length).toBeLessThanOrEqual(MAX_WALK_FOLDERS + 16);
+  } finally {
+    resolved.mockRestore();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

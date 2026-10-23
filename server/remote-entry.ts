@@ -1,10 +1,11 @@
 // The bundle is launched only through SSH. Keep it alive after the tunnel closes;
 // herdr owns the terminal processes and no disconnect should terminate their work.
 import { createServer } from "./index.ts";
-import { bridgeIdentity, descriptorPath, registerBridge } from "./bridge.ts";
+import { bridgeIdentity, descriptorLive, descriptorPath, registerBridge } from "./bridge.ts";
+import { acquireOwnerDirectory } from "./owner-guard.ts";
 import { parseProcessLine, refusedSocket, staleMarker } from "./herdr-marker.ts";
 import { psQuote } from "./powershell.ts";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { delimiter, dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
@@ -54,22 +55,11 @@ async function spawnDetachedWindows(exe: string, args: string[], log: string): P
 
 const descriptor = descriptorPath();
 mkdirSync(dirname(descriptor), { recursive: true, mode: 0o700 });
-const lock = descriptor + ".lock";
-try { mkdirSync(lock, { mode: 0o700 }); } catch {
-  let stale = false;
-  try {
-    const owner = Number(readFileSync(join(lock, "pid"), "utf8"));
-    if (Number.isInteger(owner) && owner > 0) {
-      try { process.kill(owner, 0); } catch (e) { stale = (e as NodeJS.ErrnoException).code === "ESRCH"; }
-    }
-  } catch { /* a concurrent starter may not yet have written its PID */ }
-  if (!stale) throw new Error("Another bridge is starting; retry shortly");
-  rmSync(lock, { recursive: true }); mkdirSync(lock, { mode: 0o700 });
-}
-writeFileSync(join(lock, "pid"), String(process.pid), { mode: 0o600 });
+// the lock records its owner's birth: a PID that now belongs to another process does not block this start
+const lock = acquireOwnerDirectory(descriptor + ".lock", { running: "Another bridge is starting; retry shortly", starting: "Another bridge is starting; retry shortly" });
 try {
   let existing = false;
-  try { const data = JSON.parse(readFileSync(descriptor, "utf8")); process.kill(data.pid, 0); existing = true; } catch {}
+  try { existing = descriptorLive(JSON.parse(readFileSync(descriptor, "utf8"))); } catch {}
   if (!existing) {
   try { await bridgeIdentity(); } catch (error) {
     // A socket that exists but cannot answer is an operator problem, not permission
@@ -97,8 +87,14 @@ try {
   const token = randomBytes(32).toString("hex");
   const server = createServer({ port: 0, hostname: "127.0.0.1", token, machines: false, stateDir: descriptor + ".state" });
   const registration = registerBridge(server.port, token);
+  if (!registration.registered) {
+    // the app finds a bridge only through its descriptor: an unregistered one serves nobody, and
+    // the app would start one more on every retry, so this one stops
+    server.stop();
+    throw new Error(`This bridge stopped because it was not registered (descriptor ${descriptor})`);
+  }
   const close = () => { registration.close(); server.stop(); setTimeout(() => process.exit(0), 2000); };
   process.on("SIGTERM", close);
   process.on("SIGINT", close);
   }
-} finally { rmSync(lock, { recursive: true, force: true }); }
+} finally { lock.release(); }

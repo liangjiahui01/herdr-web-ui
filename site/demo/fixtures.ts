@@ -4,7 +4,7 @@
  * curated chats and one Codex approval. Nothing here comes from a real machine. It imports no server
  * code, so the browser bundle can take it.
  */
-import type { ConversationTurn, InteractivePrompt, SessionHistoryAgent, SessionHistoryRow } from "../../shared/protocol.ts";
+import type { ConversationTurn, InteractivePrompt, SessionHistoryAgent, SessionHistoryRow, SlashCommand } from "../../shared/protocol.ts";
 
 export interface DemoSpec {
   key: string;
@@ -50,6 +50,30 @@ export function sessionHistoryRows(agent: SessionHistoryAgent): SessionHistoryRo
     row(`demo-${agent}-0001`, "Flaky export test", "Why does the export test fail one run in ten?", 0, 3),
   ];
 }
+/**
+ * The skills an agent would offer in a demo folder before any pane runs it (GET /api/agent/commands):
+ * Codex types its skills as `$name`, the others as `/name`; a project skill and one of the user's own
+ * for each, so the new workspace and tab dialogs show both. Agents not listed here offer none.
+ */
+export function agentSkillRows(agent: string): SlashCommand[] {
+  const skill = (name: string, description: string, origin: "user" | "project"): SlashCommand => ({
+    name, description, source: "skill", origin, ...(agent === "codex" ? { trigger: "$" as const } : {}),
+    forms: [{ match: "bare", interaction: "unknown" }, { match: "other", interaction: "unknown" }],
+    visibility: "offered", provenance: { transport: "scan", verified: false }, id: `/home/demo/${origin === "project" ? "checkout-api/.agents" : ".agents"}/skills/${name}/SKILL.md`,
+  });
+  switch (agent) {
+    case "codex":
+      return [skill("review-pr", "Review the branch against main and list the findings", "project"), skill("release-notes", "Draft release notes from the merged pull requests", "user"), skill("flaky-tests", "Find and fix a flaky test by its history", "user")];
+    case "claude":
+      return [skill("review-pr", "Review the branch against main and list the findings", "project"), skill("changelog", "Write the changelog fragment for a change", "user")];
+    case "omp":
+    case "pi":
+      return [skill("plan-config", "Plan a config file's keys before writing it", "project")];
+    default:
+      return [];
+  }
+}
+
 const tool = (name: string, summary: string, input: unknown, output: string): ConversationTurn["parts"][number] => ({ kind: "tool", name, summary, input: typeof input === "string" ? input : JSON.stringify(input, null, 2), output });
 
 export const CHATS: Record<string, { turns: ConversationTurn[]; metadata: { model: string; reasoning_effort: string } }> = {

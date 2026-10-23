@@ -1,9 +1,34 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { answerKeys, parseInteractivePrompt } from "../prompt.ts";
+import { answerKeys, claudeRewindOpen, parseInteractivePrompt } from "../prompt.ts";
 
 const fixture = (state: string, width: number): string =>
   readFileSync(new URL(`../fixtures/claude-goal-2.1.304-${state}-${width}.txt`, import.meta.url), "utf8");
+
+/** Claude Code 2.1.304's /rewind, recorded over a resumed apple/banana session (fixtures named by state and width) */
+const rewind = (state: string, width: number): string =>
+  readFileSync(new URL(`../fixtures/claude-rewind-2.1.304-${state}-${width}.txt`, import.meta.url), "utf8");
+
+describe("Claude Code's terminal rewind", () => {
+  test("does not block sends for a quoted panel above Claude's input box", () => {
+    expect(claudeRewindOpen(`${rewind("confirm-apple-restore", 40)}\n${rewind("closed", 40)}`)).toBe(false);
+  });
+
+  test("holds sends when an earlier input box is above the live rewind panel", () => {
+    expect(claudeRewindOpen(`${rewind("closed", 40)}\n${rewind("confirm-apple-summarize-from", 40)}`)).toBe(true);
+  });
+
+  for (const width of [40, 120]) {
+    test(`protects terminal rewind fields without offering cards at ${width} columns`, () => {
+      for (const state of ["confirm-apple-restore", "confirm-apple-summarize-from", "confirm-apple-summarize-up-to", "confirm-apple-never-mind", "confirm-apple-restore-esc", "confirm-apple-summarize-from-esc", "confirm-long-610"]) {
+        const screen = rewind(state, width);
+        expect(claudeRewindOpen(screen), state).toBe(true);
+        expect(parseInteractivePrompt("claude", screen), state).toBeNull();
+      }
+      expect(claudeRewindOpen(rewind("confirm-apple-esc-esc", width))).toBe(false);
+    });
+  }
+});
 
 describe("Claude Code's bare /goal", () => {
   for (const width of [40, 120]) {

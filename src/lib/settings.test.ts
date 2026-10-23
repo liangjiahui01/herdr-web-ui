@@ -112,12 +112,41 @@ describe("saved theme migration", () => {
     } });
     const settings = sanitizeSettings({ theme: "light", lightTheme: "dracula" });
     const entry = themeFor(settings, "light");
-    applyToDocument(settings, entry, "en");
+    withComputedBg("#282a36", () => applyToDocument(settings, entry, "en"));
     expect(root.dataset).toMatchObject({ theme: "dark", palette: "dracula" });
     expect(root.style.colorScheme).toBe("dark");
     expect(meta).toBe(entry.bgPanel);
     expect(terminalTheme(entry.mode, entry.id)).toEqual(entry.terminal);
   });
+
+  it("keeps the row's surface on the root until a stylesheet owns it, following later themes", () => {
+    const style = {
+      colorScheme: "", backgroundColor: "#fffaf3", setProperty() {}, removeProperty(name: string) { if (name === "background-color") style.backgroundColor = ""; },
+    };
+    const root = { lang: "", dataset: {}, style };
+    Object.defineProperty(globalThis, "document", { configurable: true, value: { documentElement: root, querySelector: () => null } });
+    const light = sanitizeSettings({ theme: "light", lightTheme: "rose-pine-dawn", darkTheme: "kanagawa" });
+    // the stylesheet failed: nothing defines --bg, so the boot surface stays, on whichever row is drawn
+    withComputedBg("", () => applyToDocument(light, themeFor(light, "light"), "en"));
+    expect(style.backgroundColor).toBe(themeFor(light, "light").bg);
+    const dark = { ...light, theme: "dark" as const };
+    withComputedBg("", () => applyToDocument(dark, themeFor(dark, "dark"), "en"));
+    expect(style.backgroundColor).toBe(themeFor(dark, "dark").bg);
+    // a stylesheet that owns the surface takes it back
+    withComputedBg(" #1f1f28", () => applyToDocument(dark, themeFor(dark, "dark"), "en"));
+    expect(style.backgroundColor).toBe("");
+  });
+
+  function withComputedBg(value: string, run: () => void): void {
+    const saved = Object.getOwnPropertyDescriptor(globalThis, "getComputedStyle");
+    Object.defineProperty(globalThis, "getComputedStyle", { configurable: true, value: () => ({ getPropertyValue: (name: string) => (name === "--bg" ? value : "") }) });
+    try {
+      run();
+    } finally {
+      if (saved) Object.defineProperty(globalThis, "getComputedStyle", saved);
+      else Reflect.deleteProperty(globalThis, "getComputedStyle");
+    }
+  }
 });
 
 it("keeps a tab's pane while out of use until this device turns the pause on", () => {
@@ -134,6 +163,15 @@ it("leaves herdr's focus alone until this device asks to follow it, and keeps th
   expect(sanitizeSettings({ followHerdrFocus: "true" }).followHerdrFocus).toBe(false);
   expect(SETTING_SCOPE.followHerdrFocus).toBe("device");
   expect(SHARED_SETTING_KEYS as readonly string[]).not.toContain("followHerdrFocus");
+});
+
+it("keeps the composer's New tab button off until this device turns it on, and keeps that choice its own", () => {
+  expect(DEFAULT_SETTINGS.composerNewTabButton).toBe(false);
+  expect(sanitizeSettings({}).composerNewTabButton).toBe(false);
+  expect(sanitizeSettings({ composerNewTabButton: true }).composerNewTabButton).toBe(true);
+  expect(sanitizeSettings({ composerNewTabButton: "true" }).composerNewTabButton).toBe(false);
+  expect(SETTING_SCOPE.composerNewTabButton).toBe("device");
+  expect(SHARED_SETTING_KEYS as readonly string[]).not.toContain("composerNewTabButton");
 });
 
 it("keeps the screen wake lock off until this device explicitly enables it", () => {

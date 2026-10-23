@@ -1,8 +1,9 @@
-import { expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { expect, it, spyOn } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeviceStore } from "./devices.ts";
+import { privateStateFs } from "./private-state.ts";
 import { MachineRelay } from "./machine-relay.ts";
 import type { MachineManager } from "./machines.ts";
 import { startFakePushService } from "./push.fake.ts";
@@ -11,6 +12,11 @@ import { workspaceCreate, workspaceClose } from "./herdr/client.ts";
 import type { ServerMessage } from "../shared/protocol.ts";
 
 const guard = { "x-herdr-machine": "1", "content-type": "application/json" };
+
+/** Fails every flush of a private state file, before its rename, until restored. */
+function failFileSync() {
+  return spyOn(privateStateFs, "fsyncSync").mockImplementation(() => { throw Object.assign(new Error("EIO: i/o error, fsync"), { code: "EIO" }); });
+}
 
 async function connect(url: string, cookie: string) {
   // Bun supports handshake headers; lib.dom's browser constructor does not list them.
@@ -136,15 +142,15 @@ it("keeps a forwarded first-pair gate open until a returned cookie is durably co
     expect((await stranger()).status).toBe(200);
     const confirmedCookie = await issue(await start());
     expect((await stranger()).status).toBe(200);
-    const blocked = join(root, `devices.json.${process.pid}.tmp`);
-    mkdirSync(blocked);
-    const failed = await fetch(`${base}/api/devices`, { headers: { ...forwarded, cookie: confirmedCookie } });
-    expect(failed.status).toBe(500);
-    expect(failed.headers.get("content-type")).toContain("application/json");
-    expect(await failed.json()).toMatchObject({ error: { code: "internal_error" } });
-    expect((await stranger()).status).toBe(200);
-    expect(() => readFileSync(join(root, "devices.json"), "utf8")).toThrow();
-    rmSync(blocked, { recursive: true });
+    const fsync = failFileSync();
+    try {
+      const failed = await fetch(`${base}/api/devices`, { headers: { ...forwarded, cookie: confirmedCookie } });
+      expect(failed.status).toBe(500);
+      expect(failed.headers.get("content-type")).toContain("application/json");
+      expect(await failed.json()).toMatchObject({ error: { code: "internal_error" } });
+      expect((await stranger()).status).toBe(200);
+      expect(() => readFileSync(join(root, "devices.json"), "utf8")).toThrow();
+    } finally { fsync.mockRestore(); }
     expect((await fetch(`${base}/api/devices`, { headers: { ...forwarded, cookie: confirmedCookie } })).status).toBe(200);
     expect((await stranger()).status).toBe(401);
     const registry = JSON.parse(readFileSync(join(root, "devices.json"), "utf8")) as { gate_closed_at: string | null; devices: unknown[] };
@@ -297,15 +303,15 @@ it("returns an error when revocation cannot be persisted, then allows a successf
   store.match(paired.token);
   const server = createServer({ port: 0, stateDir: root, token: "test-write", tailscaleOwner: null, machines: false });
   const base = `http://127.0.0.1:${server.port}`;
-  const blocked = join(root, `devices.json.${process.pid}.tmp`);
   try {
-    mkdirSync(blocked);
     const revoke = () => fetch(`${base}/api/devices/${paired.device.id}`, { method: "DELETE", headers: { ...guard, authorization: "Bearer test-write" } });
-    const failed = await revoke();
-    expect(failed.status).toBe(500);
-    expect(await failed.json()).toMatchObject({ error: { code: "internal_error" } });
-    expect(new DeviceStore(root).match(paired.token)).not.toBeNull();
-    rmSync(blocked, { recursive: true });
+    const fsync = failFileSync();
+    try {
+      const failed = await revoke();
+      expect(failed.status).toBe(500);
+      expect(await failed.json()).toMatchObject({ error: { code: "internal_error" } });
+      expect(new DeviceStore(root).match(paired.token)).not.toBeNull();
+    } finally { fsync.mockRestore(); }
     expect((await revoke()).status).toBe(204);
     expect(new DeviceStore(root).match(paired.token)).toBeNull();
   } finally { server.stop(); rmSync(root, { recursive: true, force: true }); }

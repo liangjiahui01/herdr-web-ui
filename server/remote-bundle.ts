@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { access, mkdir, readdir, readFile, rename, rm, stat } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { REMOTE_BUNDLE_VERSION } from "../shared/machines.ts";
+import { discard, readCappedJson, REMOTE_LIMITS } from "./remote-json.ts";
 
 export interface BundleManifest {
   version: string;
@@ -88,7 +89,10 @@ export async function bundleFile(platform: string, signal: AbortSignal, options:
   const source = await bundleManifestSource(platform, options);
   const https = source.startsWith("https://");
   const manifest: BundleManifest = https
-    ? await fetch(source, { signal }).then(async (r) => { if (!r.ok) throw new Error(`Remote bundle for ${platform} is unavailable (HTTP ${r.status}). On the web server, run bun run build:remote ${platform}, or configure HERDR_WEB_BUNDLE_MANIFEST.`); return r.json() as Promise<BundleManifest>; })
+    ? await fetch(source, { signal }).then(async (r) => {
+      if (!r.ok) { await discard(r); throw new Error(`Remote bundle for ${platform} is unavailable (HTTP ${r.status}). On the web server, run bun run build:remote ${platform}, or configure HERDR_WEB_BUNDLE_MANIFEST.`); }
+      return readCappedJson<BundleManifest>(r, REMOTE_LIMITS.bundleManifest);
+    })
     : JSON.parse(await readFile(source, { encoding: "utf8", signal }));
   if (manifest.version !== REMOTE_BUNDLE_VERSION) throw new Error("Remote bundle version mismatch");
   const asset = manifest.assets[platform];

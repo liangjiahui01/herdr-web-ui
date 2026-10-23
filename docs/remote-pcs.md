@@ -60,7 +60,8 @@ The current server keeps one status-only WebSocket per remote PC without attachi
 |---|---|
 | `GET /api/health?scope=bridge` | App/auth liveness independent of local herdr |
 | `GET /api/bridge` | Authenticated protocol, runtime version, PID and socket identity |
-| `GET /api/machines` | PC state plus cached snapshots |
+| `GET /api/machines` | PC state plus cached snapshots; each snapshot keeps its server's `order_epoch`/`read_seq`, and `source_boot_id` is the boot id the manager last proved for that PC (its own for the local PC) |
+| `GET /api/machines?verify_source_boot=:id` | The roster plus `verified_source_boot: { machine_id, boot_id }`, the boot id of the server behind that PC asked for during this request (a remote one by the manager's authenticated `GET /api/health` over its connection, never a cached answer). 400 for an empty or repeated query, 404 for an unknown PC, 503 `source_unverified` when no fresh proof came, and 503 with `Retry-After: 1` when that PC's last health call started under a second ago: the browser asks again at its next poll, reconnect or roster from another server lifetime. The manager runs at most one such call per PC and starts them at least 1000 ms apart; that bound, not the browser's coalescing or the 15 s deadline, is what limits the load on a remote PC. It adds no access beyond the authenticated reads the proxy already makes |
 | `GET /api/machines/events` | SSE roster and machine-scoped status events |
 | `POST /api/machines/setup` | Create an interactive setup job |
 | `GET/POST/DELETE /api/machines/setup/:id` | Inspect, answer/approve, cancel |

@@ -2516,6 +2516,36 @@ Step 4: Credential source
     }
   });
 
+  test("reads GJC Nerd Font question cursors without exposing transcript summaries as choices", () => {
+    const dialog = `──────────────
+
+Use read-only checks.
+
+Which approach?
+
+──────────────
+│ Inspect now (Recommended) │
+│  Clarify scope first       │
+│  Other (type your own)     │
+──────────────
+
+ ↑/↓ select  enter  esc  PgUp/PgDn/Ctrl+u/d: question · Wheel: transcript
+
+──────────────
+`;
+    const screen = `Earlier question summary\n├─  Inspect now\n└─  Clarify scope first\n\nWorking…\n${dialog}`;
+    const prompt = parseFallbackPrompt("gjc", screen);
+    expect(labels(prompt)).toEqual(["Inspect now (Recommended)", "Clarify scope first", "Other (type your own)", "Esc"]);
+    expect(prompt.question).toBe("Which approach?");
+    expect(prompt.body).toBe("Use read-only checks.");
+    expect(answerKeys(prompt, { option_index: 1 })).toEqual([{ keys: ["down"] }, { keys: ["enter"] }]);
+    const moved = parseFallbackPrompt("gjc", screen.replace("│ Inspect", "│  Inspect").replace("│  Clarify", "│ Clarify"));
+    expect(moved.id).toBe(prompt.id);
+    expect(answerKeys(moved, { option_index: 0 })).toEqual([{ keys: ["up"] }, { keys: ["enter"] }]);
+    expect(labels(parseFallbackPrompt("claude", screen))).toEqual(["↑", "↓", "Enter", "Esc"]);
+    expect(labels(parseFallbackPrompt("gjc", screen.replace("│ Inspect", "│  Inspect")))).toEqual(["↑", "↓", "Enter", "Esc"]);
+  });
+
   test("does not infer GJC choices without the exact footer, a selected row, or the GJC agent", () => {
     const footer = "[↑↓ to navigate, Enter to select, Esc to cancel]";
     const generic = ["↑", "↓", "Enter", "Esc"];
@@ -2976,6 +3006,22 @@ describe("pi's dialogs", () => {
     // the cursor sits on the first row, so one option is one key step per row above it
     expect(answerKeys(prompt, { option_index: 1 })).toEqual([{ keys: ["down"] }, { keys: ["enter"] }]);
     expect(answerKeys(prompt, { option_index: 2 })).toEqual([{ keys: ["down"] }, { keys: ["down"] }, { keys: ["enter"] }]);
+  });
+
+  // As OmO 5.1.40 drew its init-deep advisor: pi's widget, Escape named `esc`, a timeout ticking in the title
+  test("reads OmO's select, which names Escape esc and counts down in its title", () => {
+    const omo = (seconds: number, title = "Init-deep") => piScreen(` ${title} (${seconds}s)\n\n → Run now\n   Skip this time\n   Never in this project\n   Never anywhere\n ↑↓ navigate  enter select  esc/ctrl+c cancel`);
+    const prompt = parseInteractivePrompt("pi", omo(9))!;
+    expect(prompt.fallback).toBeUndefined();
+    expect(prompt.question).toBe("Init-deep (9s)");
+    expect(prompt.options.map((option) => option.label)).toEqual(["Run now", "Skip this time", "Never in this project", "Never anywhere"]);
+    expect(answerKeys(prompt, { option_index: 2 })).toEqual([{ keys: ["down"] }, { keys: ["down"] }, { keys: ["enter"] }]);
+    // a tick of the countdown is the same card, so an answer tapped after it still lands
+    expect(parseInteractivePrompt("pi", omo(8))!.id).toBe(prompt.id);
+    // only the count is left out: another title is another question
+    expect(parseInteractivePrompt("pi", omo(9, "Reindex"))!.id).not.toBe(prompt.id);
+    const input = parseInteractivePrompt("pi", piScreen(" Branch name?\n\n>\n enter submit  esc/ctrl+c cancel"))!;
+    expect(input.custom_option_index).toBe(0);
   });
 
   test("reads a confirm as an approval, and declines it by pressing No", () => {

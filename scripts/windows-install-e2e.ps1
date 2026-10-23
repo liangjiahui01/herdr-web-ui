@@ -110,7 +110,10 @@ try {
         $found = Wait-Until { $status = Get-Json '/api/updates'; if ($status.latest_version) { $status } } 90 'the app to find the latest release'
         Assert ($found.available -and "v$($found.latest_version)" -eq $latest) "The app offers $($found.latest_version) (available: $($found.available)), not $latest"
         Write-Host "e2e: updating $expected to $latest"
-        Invoke-WebRequest "$origin/api/updates/install" -Method POST -Headers @{ 'x-herdr-update' = '1' } -UseBasicParsing -TimeoutSec 30 | Out-Null
+        # an install names the release it was offered, as the app's Update does; a release older
+        # than that contract ignores the body
+        $install = @{ expected_revision = $found.latest_revision } | ConvertTo-Json -Compress
+        Invoke-WebRequest "$origin/api/updates/install" -Method POST -Headers @{ 'x-herdr-update' = '1' } -ContentType 'application/json' -Body $install -UseBasicParsing -TimeoutSec 30 | Out-Null
         # the app restarts in the middle of this, so some of these questions go unanswered
         $after = Wait-Until {
             $status = Get-Json '/api/updates'

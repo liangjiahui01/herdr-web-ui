@@ -24,7 +24,8 @@ let server: ReturnType<typeof import("../server/index.ts").createServer> | undef
 let browser: Awaited<ReturnType<typeof chromium.launch>> | undefined;
 
 function entryScript(html: string): string {
-  const entry = html.match(/<script\b[^>]*\bsrc="([^"]+)"/)?.[1];
+  // the module entry, not the classic theme boot script ahead of it (scripts/theme-bootstrap-build.ts)
+  const entry = html.match(/<script\b(?=[^>]*\btype="module")[^>]*\bsrc="([^"]+)"/)?.[1];
   assert.ok(entry, "the real built shell has a module entry");
   return entry;
 }

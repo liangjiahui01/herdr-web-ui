@@ -5,7 +5,12 @@ import { join } from "node:path";
 
 import type { HerdrPane } from "../shared/protocol.ts";
 import type { CommandSend } from "./outcome.ts";
-import { closeOpenCodeNative, openCodeNativeState, openCodePaneService, releaseOpenCodePane, skillsNotAttached, startOpenCodeWatch, trackVerifiedOpenCodePanes } from "./opencode-native.ts";
+import * as herdr from "./herdr/client.ts";
+import * as omo from "./omo.ts";
+import { omoSessionFolder } from "./omo.ts";
+import * as processStart from "./process-start.ts";
+import { paneProcessRoots } from "./conversation.ts";
+import { closeOpenCodeNative, openCodeNativeState, openCodePaneService, openCodeSkillsToType, releaseOpenCodePane, skillsNotAttached, startOpenCodeWatch, trackVerifiedOpenCodePanes } from "./opencode-native.ts";
 import { commandOutcome } from "./outcome.ts";
 import * as service from "./opencode-service.ts";
 import { forgetOpenCodeService, openCodeServiceOptions } from "./opencode-service.ts";
@@ -66,6 +71,54 @@ describe("recording a send never waits on OpenCode's service", () => {
     expect(startOpenCodeWatch({ ...pane, agent: "claude", agent_session: null } as unknown as HerdrPane, sent)).toBeNull();
     expect(startOpenCodeWatch(pane, { ...sent, form: { match: "bare", interaction: "terminal" } })).toBeNull();
     expect(startOpenCodeWatch(pane, undefined)).toBeNull();
+  });
+
+  it("does not treat an OmO pane herdr labels opencode as OpenCode", async () => {
+    const omoPane = { ...pane, agent: "opencode", agent_session: { agent: "opencode", source: "herdr:opencode", kind: "id", value: "ses_omo001" } } as unknown as HerdrPane;
+    const home = join(root, "omo-home");
+    const agentDir = join(home, ".omo", "agent");
+    const holders = join(agentDir, "sessions", omoSessionFolder(root), "session-holders", "sess_omo001");
+    mkdirSync(holders, { recursive: true });
+    // a fixed start for the omo process: only /proc (Linux) or ps (macOS) can read a real one, never Windows
+    const startedAt = 1_700_000_000_000;
+    writeFileSync(join(holders, `${process.pid}.json`), JSON.stringify({ pid: process.pid, processStartedAtMs: startedAt, cwd: root }));
+    const started = spyOn(processStart, "processStartedAt").mockReturnValue(startedAt);
+    const oldHome = process.env["HOME"];
+    process.env["HOME"] = home;
+    const rpc = spyOn(herdr, "herdrRpc").mockResolvedValue({ process_info: { foreground_processes: [{ pid: process.pid, argv: ["omo"], cwd: root }] } } as never);
+    const environ = spyOn(omo, "processEnviron").mockReturnValue(null);
+    const lookup = spyOn(service, "openCodeService").mockResolvedValue(null);
+    try {
+      expect((await paneProcessRoots(omoPane.pane_id, "opencode")).omo?.held).toBeTrue();
+      expect(await openCodePaneService(omoPane)).toBeNull();
+      expect(lookup).not.toHaveBeenCalled();
+      const send = { ...sent, store: null };
+      const typed = await openCodeSkillsToType(omoPane, send, "@skill");
+      expect(typed).toEqual({ sent: send, skills: [] });
+      expect(lookup).not.toHaveBeenCalled();
+    } finally {
+      if (oldHome === undefined) delete process.env["HOME"];
+      else process.env["HOME"] = oldHome;
+      started.mockRestore();
+      environ.mockRestore();
+      rpc.mockRestore();
+      lookup.mockRestore();
+    }
+  });
+
+  it("does not probe process roots for a non-OpenCode skill send", async () => {
+    const claudePane = { ...pane, agent: "claude", agent_session: { agent: "claude", source: "herdr:claude", kind: "id", value: "ses_claude001" } } as unknown as HerdrPane;
+    const send = { ...sent, agent: "claude", store: null };
+    const rpc = spyOn(herdr, "herdrRpc");
+    const lookup = spyOn(service, "openCodeService");
+    try {
+      expect(await openCodeSkillsToType(claudePane, send, "@file")).toEqual({ sent: send, skills: [] });
+      expect(rpc).not.toHaveBeenCalled();
+      expect(lookup).not.toHaveBeenCalled();
+    } finally {
+      rpc.mockRestore();
+      lookup.mockRestore();
+    }
   });
 });
 
@@ -143,6 +196,24 @@ describe("a verification still in flight is cancelled by a reset or by its pane'
       expect(await verifying).toBeNull();
       expect(openCodeNativeState()).toEqual({ stream: false, panes: [] });
     } finally { closeOpenCodeNative(); fake.release(); fake.server.stop(true); }
+  });
+
+  it("keeps a pane released while its process roots are still being read unverified, with no stream", async () => {
+    const fake = gatedService(join(root, "inflight-roots"));
+    openCodeServiceOptions.stateDir = join(root, "inflight-roots");
+    forgetOpenCodeService();
+    closeOpenCodeNative();
+    const rootsAsked = Promise.withResolvers<void>();
+    const roots = Promise.withResolvers<unknown>();
+    const rpc = spyOn(herdr, "herdrRpc").mockImplementation((() => { rootsAsked.resolve(); return roots.promise; }) as never);
+    try {
+      const verifying = openCodePaneService(opencodePane("p_roots", "ses_roots"));
+      await within(rootsAsked.promise, "the process roots lookup");
+      releaseOpenCodePane("p_roots");
+      roots.resolve({ process_info: { foreground_processes: [] } });
+      expect(await verifying).toBeNull();
+      expect(openCodeNativeState()).toEqual({ stream: false, panes: [] });
+    } finally { rpc.mockRestore(); closeOpenCodeNative(); fake.server.stop(true); }
   });
 
   for (const cancel of ["reset", "pane end"] as const) {
